@@ -25,19 +25,25 @@ _KEY="${MEM0_API_KEY:-}"
 
 ### Check 2: Identity resolution
 
-Resolve identity from the `MEM0_*` environment variables set by the plugin's `shell.env` hook. These are the exact values the plugin uses to scope memories, so report them directly. Do NOT re-run `git` here: the plugin already resolved branch and project from git at session start, and re-shelling git can disagree with it — e.g. it prints an empty branch that renders as `(not a git repo)` while the Session check below shows `branch=main`. One source of truth keeps the two lines consistent.
+Report the identity the plugin uses for THIS session. The plugin resolves
+`user_id` per session (not per plugin instance) by looking up the session's
+OpenCode `projectID`, so in multi-project hosts like OpenChamber each session
+gets its own bucket. The `shell.env` hook exports the resolved value into the
+current shell, so read it back verbatim — do NOT re-run `git`.
 
 ```bash
 echo "user_id=${MEM0_USER_ID:-${USER:-default}}"
+echo "session_id=${MEM0_SESSION_ID:-}"
 echo "branch=${MEM0_BRANCH:-main}"
 _S="$HOME/.mem0/settings.json"
 _SCOPE="$(grep -o '"default_scope"[[:space:]]*:[[:space:]]*"[a-z]*"' "$_S" 2>/dev/null | grep -o '[a-z]*"$' | tr -d '"')"
 echo "default_scope=${_SCOPE:-project}"
 ```
 
-- `user_id`: from `MEM0_USER_ID` (the plugin encodes the OpenCode project id into this by default — e.g. `alice-a1b2c3d4`)
-- `branch`: from `MEM0_BRANCH` (the plugin's resolved value; falls back to `main` outside a git repo)
-- `default_scope`: from `~/.mem0/settings.json` (`default_scope`), falling back to `project`. This is the scope memory tools use when none is given; change it with `/mem0-scope`.
+- `user_id`: from `MEM0_USER_ID` (the plugin encodes the OpenCode project id into this — e.g. `alice-a1b2c3d4`). If MEM0_USER_ID is set as an env override, that wins.
+- `session_id`: from `MEM0_SESSION_ID` (this session's OpenCode session id; also used as `run_id` for `scope="session"`).
+- `branch`: from `MEM0_BRANCH` (git-detected at plugin startup; falls back to `main` outside a git repo).
+- `default_scope`: from `~/.mem0/settings.json` (`default_scope`), falling back to `project`. Change with `/mem0-scope`.
 
 PASS if `user_id` is non-empty. Report the branch verbatim from `MEM0_BRANCH`; never invent a string like `(not a git repo)`.
 

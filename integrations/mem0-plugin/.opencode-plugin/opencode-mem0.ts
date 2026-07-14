@@ -5,15 +5,17 @@
 // client (client.ts), NOT the cloud `mem0ai` SDK — the cloud SDK targets the
 // hosted platform and its extras (customCategories, event queue, AND/OR
 // filters, top-level app_id) that the self-hosted server does not implement.
-// Project isolation is achieved by folding the OpenCode project id into
-// `user_id` at startup (see getUserId), so the server's flat identity model
-// is enough.
+//
+// Multi-project safety: OpenChamber (and any host that runs multiple OpenCode
+// projects inside ONE server process) will fire every hook with a `sessionID`
+// tied to a specific project. We resolve `user_id` per-session by looking up
+// the session's `projectID` on demand and caching it, so memories written from
+// project A never leak into project B's bucket.
 import type {Plugin, PluginInput} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import {Mem0HttpClient} from "./client";
 import {userInfo} from "os";
 import {resolve, dirname} from "path";
-import {randomBytes} from "crypto";
 import {existsSync, readFileSync, readdirSync} from "fs";
 import {homedir} from "os";
 import {join} from "path";
@@ -29,18 +31,17 @@ import {
 } from "./dream";
 import {asScope, scopeSearchFilters, scopeWriteParams, resolveDefaultScope, SCOPE_GUIDANCE, type Scope} from "./scope";
 
-function getUserId(project: PluginInput["project"]): string {
-  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
-  let osUser: string;
+function getOsUser(): string {
   try {
-    osUser = userInfo().username;
+    return userInfo().username;
   } catch {
-    osUser = process.env.USER || process.env.USERNAME || "unknown";
+    return process.env.USER || process.env.USERNAME || "unknown";
   }
-  // Self-hosted server has no `app_id` field. Fold the OpenCode project id
-  // (stable across branches, worktrees, and vcs churn) into user_id so each
-  // OpenCode project has its own memory bucket by default. Users who want
-  // cross-project memory set MEM0_USER_ID to a bare identifier.
+}
+
+function projectUserId(project: PluginInput["project"] | undefined): string {
+  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+  const osUser = getOsUser();
   return project?.id ? `${osUser}-${project.id}` : osUser;
 }
 
@@ -57,12 +58,6 @@ function extractMemories(res: any): Array<{ memory: string; id: string }> {
   const arr = res?.results ?? res;
   if (!Array.isArray(arr)) return [];
   return arr.map((m: any) => ({memory: m.memory ?? "", id: m.id ?? ""}));
-}
-
-function generateSessionId(): string {
-  const ts = Math.floor(Date.now() / 1000);
-  const rnd = randomBytes(3).toString("hex");
-  return `ses_${ts}_${rnd}`;
 }
 
 const SECRET_PATTERNS = [
@@ -82,7 +77,6 @@ function redact(text: string): string {
   return out;
 }
 
-/** Read & parse `~/.mem0/settings.json`, returning {} when missing/invalid. */
 function loadSettings(): Record<string, unknown> {
   try {
     const settingsPath = join(homedir(), ".mem0", "settings.json");
@@ -97,11 +91,6 @@ function loadGlobalSearch(): boolean {
   return loadSettings().global_search === true;
 }
 
-/**
- * The user's persisted default memory scope (set via the `mem0-scope` skill).
- * Read fresh so a scope change takes effect on the next memory operation without
- * restarting OpenCode. Defaults to "project".
- */
 function loadDefaultScope(): Scope {
   return resolveDefaultScope(loadSettings());
 }
@@ -118,6 +107,8 @@ const ERROR_MULTI_RE = /(Error:|Exception:)/g;
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "write", "edit", "multiEdit"]);
 
 function resolveFilters(args: any, globalSearch: boolean, userId: string): Record<string, unknown> {
+  // Self-hosted server passes `filters` straight through to mem0 OSS which only
+  // understands flat metadata equality — no AND/OR trees, no user_id="*".
   const base: Record<string, unknown> = {};
   if (args.agent_id) {
     base.agent_id = args.agent_id;
@@ -144,6 +135,20 @@ function extractUserText(input: any, output: any): string {
   return "";
 }
 
+interface SessionState {
+  userId: string;
+  runId: string;
+  initialized: boolean;
+  memoryCount: number;
+  msgCount: number;
+  systemContext: string[];
+  stats: {adds: number; searches: number; messages: number};
+  dreamTriggered: boolean;
+  dreamWriteSeen: boolean;
+}
+
+const SESSION_CACHE_MAX = 100;
+
 const Mem0Plugin: Plugin = async (ctx) => {
   const {$, client, project} = ctx;
 
@@ -165,44 +170,82 @@ const Mem0Plugin: Plugin = async (ctx) => {
 
   const apiKey = process.env.MEM0_API_KEY;
   const mem0 = new Mem0HttpClient(baseUrl, apiKey);
-  const userId = getUserId(project);
   const branch = await getBranch($);
-  const stats = {adds: 0, searches: 0, messages: 0};
-  const sessionId = generateSessionId();
   const globalSearch = loadGlobalSearch();
-
-  let initialized = false;
-  let memoryCount = 0;
-  let msgCount = 0;
-
-  const systemContext: string[] = [];
 
   const mem0StateDir = join(homedir(), ".mem0");
   const dreamConfig = loadDreamConfig(mem0StateDir);
-  let dreamTriggered = false;
-  let dreamWriteSeen = false;
+
+  const sessions = new Map<string, SessionState>();
+
+  // Resolve user_id for a specific OpenCode sessionID by fetching the session's
+  // projectID from the OpenCode server. Result is cached in the session-state
+  // map, so the lookup runs at most once per session ID.
+  async function resolveUserIdForSession(sessionID: string): Promise<string> {
+    if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+    try {
+      const res: any = await client.session.get({path: {id: sessionID}});
+      const info: any = res?.data ?? res;
+      const projectID: string | undefined = info?.projectID;
+      if (projectID) return `${getOsUser()}-${projectID}`;
+    } catch {
+    }
+    return projectUserId(project);
+  }
+
+  async function getSessionState(sessionID: string): Promise<SessionState> {
+    let state = sessions.get(sessionID);
+    if (state) return state;
+    if (sessions.size >= SESSION_CACHE_MAX) {
+      const oldest = sessions.keys().next().value;
+      if (oldest !== undefined) sessions.delete(oldest);
+    }
+    const userId = await resolveUserIdForSession(sessionID);
+    state = {
+      userId,
+      runId: sessionID,
+      initialized: false,
+      memoryCount: 0,
+      msgCount: 0,
+      systemContext: [],
+      stats: {adds: 0, searches: 0, messages: 0},
+      dreamTriggered: false,
+      dreamWriteSeen: false,
+    };
+    sessions.set(sessionID, state);
+    return state;
+  }
 
   let dreamCleanupDone = false;
   const cleanupDream = () => {
     if (dreamCleanupDone) return;
     dreamCleanupDone = true;
-    if (dreamTriggered) {
-      if (dreamWriteSeen) {
-        recordDreamCompletion(mem0StateDir);
+    // Any session that triggered a dream leaves the lock held; release once at
+    // process exit. The completion counter is best-effort per session that
+    // actually wrote during the dream.
+    let anyDream = false;
+    for (const state of sessions.values()) {
+      if (state.dreamTriggered) {
+        anyDream = true;
+        if (state.dreamWriteSeen) recordDreamCompletion(mem0StateDir);
       }
-      releaseDreamLock(mem0StateDir);
-      dreamTriggered = false;
     }
+    if (anyDream) releaseDreamLock(mem0StateDir);
   };
   try {
     process.on("beforeExit", cleanupDream);
   } catch {
   }
 
-  // Register a `/mem0-<skill>` slash command per bundled skill. OpenCode's TUI
-  // slash menu is populated from `config.command` entries (skills discovered via
-  // `skills.paths` are available to the agent's skill tool but do NOT appear as
-  // slash commands), so this is what makes `/mem0-scope` etc. typeable.
+  function readScopeFilters(args: any, state: SessionState): Record<string, unknown> {
+    if (args.scope) return scopeSearchFilters(asScope(args.scope), state.userId, state.runId);
+    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, state.userId);
+    const ds = loadDefaultScope();
+    return ds === "project"
+      ? resolveFilters(args, globalSearch, state.userId)
+      : scopeSearchFilters(ds, state.userId, state.runId);
+  }
+
   function registerCommands(skillsDir: string, opencodeConfig: any) {
     for (const entry of readdirSync(skillsDir, {withFileTypes: true})) {
       if (!entry.isDirectory()) continue;
@@ -223,22 +266,10 @@ const Mem0Plugin: Plugin = async (ctx) => {
 
 Use the mem0 memory tools (add_memory, search_memories, get_memories, get_memory, update_memory, delete_memory, delete_all_memories, delete_entities, list_entities) as instructed by the skill.
 
-Identity context (resolved at plugin startup):
-- user_id: ${userId}
-- session_id: ${sessionId}
-- branch: ${branch}`,
+Identity is resolved per session — call /mem0-status to see the active user_id, run_id, and branch.`,
         description: desc,
       };
     }
-  }
-
-  function readScopeFilters(args: any): any {
-    if (args.scope) return scopeSearchFilters(asScope(args.scope), userId, sessionId);
-    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, userId);
-    const ds = loadDefaultScope();
-    return ds === "project"
-      ? resolveFilters(args, globalSearch, userId)
-      : scopeSearchFilters(ds, userId, sessionId);
   }
 
   return {
@@ -249,19 +280,20 @@ Identity context (resolved at plugin startup):
     "experimental.session.compacting": compactionHook,
 
     "shell.env": async (
-      _input: { cwd: string; sessionID?: string },
+      input: { cwd: string; sessionID?: string },
       output: { env: Record<string, string> },
     ) => {
-      if (output?.env) {
-        output.env.MEM0_USER_ID = userId;
-        output.env.MEM0_SESSION_ID = sessionId;
-        output.env.MEM0_BRANCH = branch;
-        output.env.MEM0_GLOBAL_SEARCH = globalSearch ? "true" : "false";
-      }
+      if (!output?.env) return;
+      const userId = input?.sessionID
+        ? (await getSessionState(input.sessionID)).userId
+        : projectUserId(project);
+      output.env.MEM0_USER_ID = userId;
+      if (input?.sessionID) output.env.MEM0_SESSION_ID = input.sessionID;
+      output.env.MEM0_BRANCH = branch;
+      output.env.MEM0_GLOBAL_SEARCH = globalSearch ? "true" : "false";
     },
 
     config: async (opencodeConfig: any) => {
-      // Point OpenCode at the plugin's OWN skills directory via `skills.paths`
       const here = import.meta.filename;
       const skillsDir = [
         resolve(dirname(dirname(here)), "opencode-skills"),
@@ -275,8 +307,6 @@ Identity context (resolved at plugin startup):
         opencodeConfig.skills.paths.push(skillsDir);
       }
 
-      // Register the /mem0-* slash commands (the TUI slash menu reads these from
-      // config.command; skills.paths alone does not create slash commands).
       registerCommands(skillsDir, opencodeConfig);
     },
 
@@ -291,18 +321,19 @@ Identity context (resolved at plugin startup):
           infer: tool.schema.boolean().optional().describe("Set to false to store memory verbatim without LLM fact extraction"),
           scope: tool.schema.string().optional().describe('Write scope: "project" (this user_id, default), "session" (this run), or "global" (drop user_id, user-wide). Use "global" only when explicitly asked.')
         },
-        async execute(args) {
-          stats.adds++;
-          if (dreamTriggered) dreamWriteSeen = true;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          state.stats.adds++;
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
           const effScope: Scope = args.scope ? asScope(args.scope) : loadDefaultScope();
-          const sp = scopeWriteParams(effScope, userId, sessionId);
+          const sp = scopeWriteParams(effScope, state.userId, state.runId);
           const finalUserId = args.agent_id ? args.user_id : (args.user_id ?? sp.user_id);
 
           const meta = args.metadata ?? {};
           if (meta.confidence === undefined) meta.confidence = 0.7;
           if (!meta.source) meta.source = "opencode";
           if (!meta.type) meta.type = "task_learning";
-          if (!meta.session_id) meta.session_id = sessionId;
+          if (!meta.session_id) meta.session_id = state.runId;
           if (!meta.files) meta.files = ["*"];
           if (!meta.branch) meta.branch = branch;
 
@@ -334,10 +365,11 @@ Identity context (resolved at plugin startup):
           top_k: tool.schema.number().optional().describe("Maximum number of results to return (alternative parameter)"),
           scope: tool.schema.string().optional().describe('Search scope: "project" (default), "session" (this run only), or "global" (drop user_id, server-wide). Only use "global" when the user explicitly asks.'),
         },
-        async execute(args) {
-          stats.searches++;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          state.stats.searches++;
           const topK = args.limit ?? args.top_k ?? 10;
-          const filters = readScopeFilters(args);
+          const filters = readScopeFilters(args, state);
 
           const res = await mem0.search({
             query: args.query,
@@ -358,8 +390,9 @@ Identity context (resolved at plugin startup):
           page_size: tool.schema.number().optional().describe("Page size, mapped to top_k"),
           scope: tool.schema.string().optional().describe('Scope: "project" (default), "session", or "global" (drop user_id, server-wide). Use "global" only when explicitly asked.'),
         },
-        async execute(args) {
-          const scoped = readScopeFilters(args);
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          const scoped = readScopeFilters(args, state);
           const res = await mem0.getAll({
             user_id: (scoped.user_id as string) ?? undefined,
             agent_id: (scoped.agent_id as string) ?? undefined,
@@ -402,8 +435,9 @@ Identity context (resolved at plugin startup):
         args: {
           id: tool.schema.string().describe("The ID of the memory to delete"),
         },
-        async execute(args) {
-          if (dreamTriggered) dreamWriteSeen = true;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
           const res = await mem0.delete(args.id);
           return JSON.stringify(res);
         }
@@ -416,11 +450,12 @@ Identity context (resolved at plugin startup):
           agent_id: tool.schema.string().optional().describe("Agent ID whose memories to delete"),
           scope: tool.schema.string().optional().describe('Scope to delete: "project" (default), "session", or "global" (user-wide). Use "global" only when explicitly asked.'),
         },
-        async execute(args) {
-          if (dreamTriggered) dreamWriteSeen = true;
-          const sp = args.scope ? scopeWriteParams(asScope(args.scope), userId, sessionId) : null;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
+          const sp = args.scope ? scopeWriteParams(asScope(args.scope), state.userId, state.runId) : null;
           const res = await mem0.deleteAll({
-            user_id: sp ? sp.user_id : (args.agent_id ? args.user_id : (args.user_id ?? userId)),
+            user_id: sp ? sp.user_id : (args.agent_id ? args.user_id : (args.user_id ?? state.userId)),
             run_id: sp?.run_id,
             agent_id: args.agent_id,
           });
@@ -461,19 +496,21 @@ Identity context (resolved at plugin startup):
     },
   };
 
-  async function chatMessageHook(input: any, output: any) {
+  async function chatMessageHook(input: {sessionID: string}, output: any) {
     const userText = extractUserText(input, output);
     if (!userText || userText.length < 10) return;
 
+    const state = await getSessionState(input.sessionID);
+    const {userId, runId} = state;
     const safeText = redact(userText);
-    msgCount++;
-    stats.messages++;
+    state.msgCount++;
+    state.stats.messages++;
 
-    if (!initialized) {
-      initialized = true;
+    if (!state.initialized) {
+      state.initialized = true;
 
       if (dreamConfig.enabled) {
-        incrementSessionCount(mem0StateDir, sessionId);
+        incrementSessionCount(mem0StateDir, runId);
       }
 
       const searchFilters: Record<string, unknown> = globalSearch
@@ -483,7 +520,7 @@ Identity context (resolved at plugin startup):
       try {
         const all = await mem0.getAll(globalSearch ? {} : {user_id: userId});
         const a: any = all;
-        memoryCount =
+        state.memoryCount =
           typeof a?.count === "number"
             ? a.count
             : Array.isArray(a)
@@ -493,23 +530,23 @@ Identity context (resolved at plugin startup):
                 : 0;
 
         if (globalSearch) {
-          systemContext.push(
+          state.systemContext.push(
             `Global search is ON — searches drop the user_id filter (server-wide). Writes still use user_id="${userId}".`,
           );
         } else {
-          systemContext.push(
+          state.systemContext.push(
             `Always include user_id="${userId}" in every search_memories filter and add_memory call.`,
           );
         }
 
-        if (memoryCount === 0) {
-          systemContext.push(
+        if (state.memoryCount === 0) {
+          state.systemContext.push(
             "New project with 0 memories. Capture decisions, conventions, and learnings as you work via the add_memory tool or the remember skill.",
           );
         }
 
-        if (memoryCount > 0) {
-          systemContext.push(
+        if (state.memoryCount > 0) {
+          state.systemContext.push(
             "Search mem0 for recent decisions and task learnings before responding. Run 2 parallel searches: one for decision type, one for task_learning type.",
           );
           try {
@@ -518,26 +555,26 @@ Identity context (resolved at plugin startup):
               filters: searchFilters,
               top_k: 5,
             });
-            stats.searches++;
+            state.stats.searches++;
             const memories = extractMemories(res);
             if (memories.length > 0) {
               const memLines = memories
                 .map((m) => `- ${m.memory}`)
                 .join("\n");
-              systemContext.push(`Prior context from mem0:\n${memLines}`);
+              state.systemContext.push(`Prior context from mem0:\n${memLines}`);
             }
           } catch {
           }
         }
 
-        systemContext.push(
+        state.systemContext.push(
           "Mem0 searches apply when user references past work, decision questions, errors, or non-trivial tasks. Queries use noun-phrases, 2-4 parallel calls with different metadata.type filters, and include the current user_id.",
         );
-        systemContext.push(SCOPE_GUIDANCE);
+        state.systemContext.push(SCOPE_GUIDANCE);
         const activeScope = loadDefaultScope();
         if (activeScope !== "project") {
-          systemContext.push(
-            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${sessionId}"); "global" drops user_id from the filter (server-wide). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
+          state.systemContext.push(
+            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${runId}"); "global" drops user_id from the filter (server-wide). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
           );
         }
       } catch (err: any) {
@@ -553,16 +590,13 @@ Identity context (resolved at plugin startup):
         }
       }
 
-      // Auto-dream: when the time/session/memory gates pass, inject the
-      // consolidation protocol so the agent tidies memories before answering.
-      if (dreamConfig.enabled && dreamConfig.auto && !dreamTriggered) {
+      if (dreamConfig.enabled && dreamConfig.auto && !state.dreamTriggered) {
         const gates = checkCheapGates(mem0StateDir, dreamConfig);
-        const memGate = checkMemoryGate(memoryCount, dreamConfig);
+        const memGate = checkMemoryGate(state.memoryCount, dreamConfig);
         if (gates.proceed && memGate.pass && acquireDreamLock(mem0StateDir)) {
-          dreamTriggered = true;
-          systemContext.push(DREAM_PROTOCOL);
+          state.dreamTriggered = true;
+          state.systemContext.push(DREAM_PROTOCOL);
         } else {
-          // Make "why didn't auto-dream run?" answerable from the logs.
           const waiting = [gates.reason, memGate.reason].filter(Boolean).join("; ");
           if (waiting) {
             try {
@@ -578,7 +612,7 @@ Identity context (resolved at plugin startup):
 
     const hasRemember = NUDGE_RE.test(safeText);
     if (hasRemember) {
-      systemContext.push(
+      state.systemContext.push(
         "[MEMORY TRIGGER] User asked to remember something. Call add_memory with the user's statement, confidence=1.0, infer=false.",
       );
     }
@@ -593,7 +627,7 @@ Identity context (resolved at plugin startup):
           mem0.search({query: "session state current task", filters: resumeFilters, top_k: 3}),
           mem0.search({query: "recent decisions and learnings", filters: resumeFilters, top_k: 3}),
         ]);
-        stats.searches += 2;
+        state.stats.searches += 2;
         const all = [
           ...extractMemories(stateRes),
           ...extractMemories(decisionsRes),
@@ -606,7 +640,7 @@ Identity context (resolved at plugin startup):
         });
         if (unique.length > 0) {
           const memLines = unique.map((m) => `- ${m.memory}`).join("\n");
-          systemContext.push(
+          state.systemContext.push(
             `Session resume context:\n${memLines}\n\nThese memories provide context for resuming work.`,
           );
         }
@@ -614,45 +648,46 @@ Identity context (resolved at plugin startup):
       }
     }
 
-    if (!hasResume && memoryCount > 0) {
+    if (!hasResume && state.memoryCount > 0) {
       try {
         const msgFilters: Record<string, unknown> = globalSearch
           ? {}
           : {user_id: userId};
         const res = await mem0.search({query: safeText, filters: msgFilters, top_k: 5});
-        stats.searches++;
+        state.stats.searches++;
         const memories = extractMemories(res);
         if (memories.length > 0) {
           const memLines = memories.map((m) => `- ${m.memory}`).join("\n");
-          systemContext.push(`Relevant memories:\n${memLines}`);
+          state.systemContext.push(`Relevant memories:\n${memLines}`);
         }
       } catch {
       }
     }
 
-    if (msgCount % 3 === 0) {
+    if (state.msgCount % 3 === 0) {
       Promise.resolve().then(async () => {
         try {
           await mem0.add({
             messages: [{role: "user", content: safeText}],
             user_id: userId,
+            run_id: runId,
             metadata: {
               type: "auto_capture",
               source: "opencode",
               confidence: 0.7,
-              session_id: sessionId,
+              session_id: runId,
               branch,
             },
             infer: true,
           });
-          stats.adds++;
+          state.stats.adds++;
         } catch {
         }
       });
     }
 
-    if (msgCount % 5 === 0 && stats.adds < Math.floor(msgCount / 3)) {
-      systemContext.push(
+    if (state.msgCount % 5 === 0 && state.stats.adds < Math.floor(state.msgCount / 3)) {
+      state.systemContext.push(
         "After responding, store any new decisions, learnings, or preferences from this exchange via add_memory. Keep it to 1 sentence per memory.",
       );
     }
@@ -675,7 +710,14 @@ Identity context (resolved at plugin startup):
   }
 
   async function chatMessagesTransformHook(_input: any, output: { messages: { info: any; parts: any[] }[] }) {
-    if (systemContext.length === 0 || !output?.messages?.length) return;
+    if (!output?.messages?.length) return;
+    // messages.transform has no sessionID in `input`; pull it off the first
+    // message's info so we inject the CORRECT session's systemContext when
+    // multiple projects share one OpenCode process.
+    const sessionID: string | undefined = output.messages[0]?.info?.sessionID;
+    if (!sessionID) return;
+    const state = sessions.get(sessionID);
+    if (!state || state.systemContext.length === 0) return;
 
     const firstUser = output.messages.find(
       (m) => m.info.role === "user",
@@ -685,7 +727,7 @@ Identity context (resolved at plugin startup):
     const marker = "## Mem0 Memory Context";
     if (firstUser.parts.some((p: any) => p.type === "text" && p.text?.includes(marker))) return;
 
-    const block = `${marker}\n\n${systemContext.join("\n\n")}`;
+    const block = `${marker}\n\n${state.systemContext.join("\n\n")}`;
     const ref = firstUser.parts[0];
     firstUser.parts.unshift({...ref, type: "text", text: block});
   }
@@ -693,6 +735,8 @@ Identity context (resolved at plugin startup):
   async function toolExecuteAfterHook(input: any, _output: any) {
     const toolName: string = input?.tool ?? "";
     const toolOutput: string = input?.output ?? _output?.output ?? "";
+    const sessionID: string | undefined = input?.sessionID;
+    if (!sessionID) return;
 
     if (toolName === "bash" && toolOutput.length >= 50) {
       const command: string = input?.args?.command ?? "";
@@ -703,6 +747,7 @@ Identity context (resolved at plugin startup):
       if (!hasStrongError && multiErrors < 2) return;
 
       try {
+        const state = await getSessionState(sessionID);
         const errorLine =
           toolOutput
             .split("\n")
@@ -725,13 +770,13 @@ Identity context (resolved at plugin startup):
 
         const errorFilters: Record<string, unknown> = globalSearch
           ? {}
-          : {user_id: userId};
+          : {user_id: state.userId};
         const res = await mem0.search({
           query: `error: ${errorQuery}`,
           filters: errorFilters,
           top_k: 6,
         });
-        stats.searches++;
+        state.stats.searches++;
         const unique = extractMemories(res);
 
         let ctx = `Error detected: \`${command.slice(0, 100)}\` produced:\n> ${errorLine}`;
@@ -744,25 +789,29 @@ Identity context (resolved at plugin startup):
         }
         ctx +=
           "\nStore resolved errors as anti_pattern or bug_fix memories for future reference.";
-        systemContext.push(ctx);
+        state.systemContext.push(ctx);
       } catch {
       }
     }
   }
 
   async function compactionHook(input: { sessionID?: string }, output: { context: string[]; prompt?: string }) {
+    const sessionID = input?.sessionID;
+    if (!sessionID) return;
     try {
-      const compactSessionId = input?.sessionID ?? sessionId;
-      const summaryContent = `Session compacting. User: ${userId}. Branch: ${branch}. Session: ${compactSessionId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
+      const state = await getSessionState(sessionID);
+      const {userId, runId, stats} = state;
+      const summaryContent = `Session compacting. User: ${userId}. Branch: ${branch}. Session: ${runId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
       Promise.resolve().then(async () => {
         try {
           await mem0.add({
             messages: [{role: "user", content: summaryContent}],
             user_id: userId,
+            run_id: runId,
             metadata: {
               type: "session_state",
               source: "pre-compaction",
-              session_id: compactSessionId,
+              session_id: runId,
               branch,
             },
             infer: true,
