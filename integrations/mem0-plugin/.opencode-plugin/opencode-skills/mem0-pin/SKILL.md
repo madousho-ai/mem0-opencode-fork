@@ -17,7 +17,7 @@ The user provides either a search query or memory ID.
 - Call `get_memory` with the ID.
 
 **If search query:**
-- Call `search_memories` with the query, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=5`.
+- Call `search_memories` with the query, `filters={"user_id": "<id>"}` (flat dict — no AND/OR), `top_k=5`.
 - Show numbered list with content previews.
 - Ask: "Which memory to pin? Enter a number."
 
@@ -41,10 +41,10 @@ update_memory(id=<selected_id>, text=pinned_text)
 1. Call `add_memory` with:
    - `text="[PINNED] <the user's text>"`
    - `user_id=<active_user_id>`
-   - `app_id=<active_project_id>`
    - `metadata={"pinned": true, "type": "decision", "confidence": 1.0}`
    - `infer=False`
-2. The response contains `event_id`. Call `get_event_status(event_id=<event_id>)` once to retrieve the memory ID, then confirm.
+2. The self-hosted server responds synchronously — extract the memory ID from
+   `results[0].id` and confirm. There is no event queue.
 
 ### Step 4: Confirm
 

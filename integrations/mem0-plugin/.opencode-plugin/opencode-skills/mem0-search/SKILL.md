@@ -27,10 +27,11 @@ When an ID is detected:
 
 ### Step 2: Search
 
-Run 2 parallel `search_memories` calls:
+Run 2 parallel `search_memories` calls (flat filter dict — the self-hosted
+server does NOT understand AND/OR trees):
 
-1. Broad: `query=<user's query>`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=10`, `rerank=true`
-2. Targeted: `query=<user's query>`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}, {"metadata": {"type": "decision"}}]}`, `top_k=5`, `rerank=true`
+1. Broad: `query=<user's query>`, `filters={"user_id": "<id>"}`, `top_k=10`
+2. Targeted: `query=<user's query>`, `filters={"user_id": "<id>", "type": "decision"}`, `top_k=5`
 
 ### Step 3: Display
 
@@ -48,7 +49,7 @@ Format: `<number>. [<type>] <content, 80 chars> (<date>) [mem0:<short_id>]`
 
 If no results:
 ```
-No memories matching "<query>" for project <project_id>.
+No memories matching "<query>" for user_id <active_user_id>.
 ```
 
 ## Output formatting

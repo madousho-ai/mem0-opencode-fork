@@ -26,7 +26,7 @@ If no argument, ask: "What should I forget? Provide a search query or memory ID.
 **If search query provided:**
 - Call `search_memories` with:
   - `query=<user's query>`
-  - `filters={"AND": [{"user_id": "<active_user_id>"}, {"app_id": "<project_id>"}]}`
+  - `filters={"user_id": "<active_user_id>"}` (flat dict — self-hosted server does NOT understand AND/OR trees)
   - `top_k=10`
 - Show numbered list:
   ```
@@ -62,7 +62,7 @@ If the user says "undo last N memories" or "undo last write":
 1. Check the `MEM0_SESSION_ID` environment variable (set by the plugin's shell.env hook).
 2. If `MEM0_SESSION_ID` is set, call `search_memories` with:
    - `query="recently added"`
-   - `filters={"AND": [{"user_id": "<active_user_id>"}, {"app_id": "<project_id>"}, {"metadata": {"session_id": "<MEM0_SESSION_ID>"}}]}`
+   - `filters={"user_id": "<active_user_id>", "session_id": "<MEM0_SESSION_ID>"}`
    - `top_k=20`
 3. Sort results by creation time descending and show the last N entries (default 1). Ask for confirmation.
 4. Delete confirmed entries via `delete_memory`.

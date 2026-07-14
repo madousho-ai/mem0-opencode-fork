@@ -1,17 +1,24 @@
 // Mem0 memory plugin for OpenCode: captures and recalls memories across sessions
-// (add / search / manage) via the Mem0 platform, wired through OpenCode plugin hooks.
-// Memory operations are exposed as native OpenCode tools backed by the mem0ai SDK
-// (no MCP server required).
-import type {Plugin} from "@opencode-ai/plugin";
+// (add / search / manage) against a SELF-HOSTED mem0 FastAPI server
+// (mem0-opencode-fork/server/), wired through OpenCode plugin hooks. Memory
+// operations are exposed as native OpenCode tools backed by our own thin HTTP
+// client (client.ts), NOT the cloud `mem0ai` SDK — the cloud SDK targets the
+// hosted platform and its extras (customCategories, event queue, AND/OR
+// filters, top-level app_id) that the self-hosted server does not implement.
+//
+// Multi-project safety: OpenChamber (and any host that runs multiple OpenCode
+// projects inside ONE server process) will fire every hook with a `sessionID`
+// tied to a specific project. We resolve `user_id` per-session by looking up
+// the session's `projectID` on demand and caching it, so memories written from
+// project A never leak into project B's bucket.
+import type {Plugin, PluginInput} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
-import {MemoryClient} from "mem0ai";
+import {Mem0HttpClient} from "./client";
 import {userInfo} from "os";
 import {basename, resolve, dirname} from "path";
-import {randomBytes} from "crypto";
-import {existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync} from "fs";
+import {existsSync, readFileSync, readdirSync} from "fs";
 import {homedir} from "os";
 import {join} from "path";
-import {createHash} from "crypto";
 import {
   loadDreamConfig,
   incrementSessionCount,
@@ -23,36 +30,35 @@ import {
   DREAM_PROTOCOL,
 } from "./dream";
 import {asScope, scopeSearchFilters, scopeWriteParams, resolveDefaultScope, SCOPE_GUIDANCE, type Scope} from "./scope";
-import {parseProjectFromRemote} from "./project";
 
-async function getUserId(): Promise<string> {
-  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+function getOsUser(): string {
   try {
     return userInfo().username;
   } catch {
+    return process.env.USER || process.env.USERNAME || "unknown";
   }
-  return process.env.USER || process.env.USERNAME || "unknown";
 }
 
-async function getProjectId($: any): Promise<string> {
-  if (process.env.MEM0_APP_ID) return process.env.MEM0_APP_ID;
-  // Prefer the git remote's owner/repo — stable across clones, worktrees, and
-  // sub-directories (handles https + ssh, incl. custom host aliases).
-  try {
-    const r = await $`git remote get-url origin`.quiet();
-    const project = parseProjectFromRemote(r.stdout.toString());
-    if (project) return project;
-  } catch {
-  }
-  // No usable remote: use the git repo ROOT dir name, not cwd (which may be a
-  // sub-directory, or your home dir if OpenCode was launched outside a repo).
-  try {
-    const r = await $`git rev-parse --show-toplevel`.quiet();
-    const top = r.stdout.toString().trim();
-    if (top) return basename(top);
-  } catch {
-  }
-  return basename(process.cwd());
+// OpenCode's Project has no explicit `name` field, so we derive a
+// human-readable identifier from the worktree path's last segment AND append
+// the first 8 chars of `project.id` so two projects with the same folder name
+// (`/home/a/foo` vs `/tmp/foo`) still get distinct user_ids. If only one of
+// worktree/id is available we degrade gracefully. Set MEM0_USER_ID explicitly
+// to override the whole scheme.
+const ID_SUFFIX_LEN = 8;
+
+function projectSlug(worktree?: string, id?: string): string | undefined {
+  const name = worktree ? basename(worktree.replace(/\/+$/, "")) : "";
+  const suffix = id ? id.slice(0, ID_SUFFIX_LEN) : "";
+  if (name && suffix) return `${name}-${suffix}`;
+  return name || suffix || undefined;
+}
+
+function projectUserId(project: PluginInput["project"] | undefined): string {
+  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+  const osUser = getOsUser();
+  const slug = projectSlug(project?.worktree, project?.id);
+  return slug ? `${osUser}-${slug}` : osUser;
 }
 
 async function getBranch($: any): Promise<string> {
@@ -68,12 +74,6 @@ function extractMemories(res: any): Array<{ memory: string; id: string }> {
   const arr = res?.results ?? res;
   if (!Array.isArray(arr)) return [];
   return arr.map((m: any) => ({memory: m.memory ?? "", id: m.id ?? ""}));
-}
-
-function generateSessionId(): string {
-  const ts = Math.floor(Date.now() / 1000);
-  const rnd = randomBytes(3).toString("hex");
-  return `ses_${ts}_${rnd}`;
 }
 
 const SECRET_PATTERNS = [
@@ -93,7 +93,6 @@ function redact(text: string): string {
   return out;
 }
 
-/** Read & parse `~/.mem0/settings.json`, returning {} when missing/invalid. */
 function loadSettings(): Record<string, unknown> {
   try {
     const settingsPath = join(homedir(), ".mem0", "settings.json");
@@ -108,66 +107,8 @@ function loadGlobalSearch(): boolean {
   return loadSettings().global_search === true;
 }
 
-/**
- * The user's persisted default memory scope (set via the `mem0-scope` skill).
- * Read fresh so a scope change takes effect on the next memory operation without
- * restarting OpenCode. Defaults to "project".
- */
 function loadDefaultScope(): Scope {
   return resolveDefaultScope(loadSettings());
-}
-
-const CODING_CATEGORIES = [
-  "architecture_decisions", "api_design", "data_models", "algorithms",
-  "dependencies", "environment_setup", "testing_strategy", "debugging_notes",
-  "performance", "security", "deployment", "code_conventions",
-  "error_handling", "refactoring_history", "integrations", "onboarding",
-  "project_meta",
-];
-
-function categoriesFingerprint(): string {
-  const sorted = [...CODING_CATEGORIES].sort();
-  return createHash("sha256").update(sorted.join("\n")).digest("hex").slice(0, 16);
-}
-
-function apiKeyFingerprint(apiKey: string): string {
-  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
-}
-
-async function autoSetupCategories(mem0: MemoryClient, apiKey: string): Promise<void> {
-  const stateDir = join(homedir(), ".mem0");
-  const stateFile = join(stateDir, "categories_setup.json");
-  const keyFp = apiKeyFingerprint(apiKey);
-  const catFp = categoriesFingerprint();
-
-  let state: Record<string, string> = {};
-  try {
-    if (existsSync(stateFile)) {
-      state = JSON.parse(readFileSync(stateFile, "utf8"));
-    }
-  } catch {}
-
-  if (state[keyFp] === catFp) return;
-
-  try {
-    const project = await mem0.getProject({fields: ["customCategories"]});
-    const existing: string[] = (project as any)?.custom_categories ?? (project as any)?.customCategories ?? [];
-    const sortedExisting = [...existing].sort();
-    const sortedTarget = [...CODING_CATEGORIES].sort();
-    if (JSON.stringify(sortedExisting) === JSON.stringify(sortedTarget)) {
-      state[keyFp] = catFp;
-      mkdirSync(stateDir, {recursive: true});
-      writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
-      return;
-    }
-
-    await mem0.updateProject({customCategories: CODING_CATEGORIES as any});
-
-    state[keyFp] = catFp;
-    mkdirSync(stateDir, {recursive: true});
-    writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
-  } catch {
-  }
 }
 
 const NUDGE_RE =
@@ -181,63 +122,19 @@ const ERROR_STRONG_RE =
 const ERROR_MULTI_RE = /(Error:|Exception:)/g;
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "write", "edit", "multiEdit"]);
 
-function resolveFilters(args: any, globalSearch: boolean, userId: string, appId: string): any {
-  if (args.filters) {
-    const existingFilters = args.filters;
-    if (typeof existingFilters === "object" && existingFilters !== null) {
-      const andClauses: any[] = existingFilters.AND;
-      if (Array.isArray(andClauses)) {
-        const hasUid = andClauses.some(
-          (c: any) => c && typeof c === "object" && "user_id" in c,
-        );
-        const hasAid = andClauses.some(
-          (c: any) => c && typeof c === "object" && "app_id" in c,
-        );
-        const hasAgentId = andClauses.some(
-          (c: any) => c && typeof c === "object" && "agent_id" in c,
-        );
-        const newClauses = [...andClauses];
-        if (args.agent_id || hasAgentId) {
-          if (!hasAgentId) newClauses.push({ agent_id: args.agent_id });
-        } else {
-          if (!hasUid) newClauses.push({ user_id: args.user_id ?? userId });
-        }
-        if (!hasAid) newClauses.push({ app_id: args.app_id ?? appId });
-        return { AND: newClauses };
-      } else if (andClauses === undefined) {
-        const hasUid = "user_id" in existingFilters;
-        const hasAid = "app_id" in existingFilters;
-        const hasAgentId = "agent_id" in existingFilters;
-        if (!hasAid || (!hasUid && !hasAgentId)) {
-          const existing = Object.entries(existingFilters).map(
-            ([k, v]) => ({ [k]: v }),
-          );
-          if (args.agent_id || hasAgentId) {
-            if (!hasAgentId) existing.push({ agent_id: args.agent_id });
-          } else {
-            if (!hasUid) existing.push({ user_id: args.user_id ?? userId });
-          }
-          if (!hasAid) existing.push({ app_id: args.app_id ?? appId });
-          return { AND: existing };
-        }
-      }
-    }
-    return args.filters;
-  }
-
-  if (globalSearch) {
-    return { OR: [{ user_id: "*" }] };
-  }
-
+function resolveFilters(args: any, globalSearch: boolean, userId: string): Record<string, unknown> {
+  // Self-hosted server passes `filters` straight through to mem0 OSS which only
+  // understands flat metadata equality — no AND/OR trees, no user_id="*".
+  const base: Record<string, unknown> = {};
   if (args.agent_id) {
-    return {
-      AND: [{ agent_id: args.agent_id }, { app_id: args.app_id ?? appId }],
-    };
+    base.agent_id = args.agent_id;
+  } else if (!globalSearch) {
+    base.user_id = args.user_id ?? userId;
   }
-
-  return {
-    AND: [{ user_id: args.user_id ?? userId }, { app_id: args.app_id ?? appId }],
-  };
+  if (args.filters && typeof args.filters === "object") {
+    return {...base, ...(args.filters as Record<string, unknown>)};
+  }
+  return base;
 }
 
 function extractUserText(input: any, output: any): string {
@@ -254,19 +151,32 @@ function extractUserText(input: any, output: any): string {
   return "";
 }
 
+interface SessionState {
+  userId: string;
+  runId: string;
+  initialized: boolean;
+  memoryCount: number;
+  msgCount: number;
+  systemContext: string[];
+  stats: {adds: number; searches: number; messages: number};
+  dreamTriggered: boolean;
+  dreamWriteSeen: boolean;
+}
+
+const SESSION_CACHE_MAX = 100;
+
 const Mem0Plugin: Plugin = async (ctx) => {
-  const {$, client} = ctx;
+  const {$, client, project} = ctx;
 
-  const apiKey = process.env.MEM0_API_KEY;
-
-  if (!apiKey) {
+  const baseUrl = process.env.MEM0_API_BASE_URL;
+  if (!baseUrl) {
     try {
       await client.app.log({
         body: {
           service: "mem0",
           level: "error",
           message:
-            "MEM0_API_KEY environment variable not set. Get one at https://app.mem0.ai/dashboard/api-keys",
+            "MEM0_API_BASE_URL environment variable not set. Point it at your self-hosted mem0 server (e.g. http://localhost:8888).",
         },
       });
     } catch {
@@ -274,53 +184,86 @@ const Mem0Plugin: Plugin = async (ctx) => {
     return {};
   }
 
-  const mem0 = new MemoryClient({apiKey});
-  const userId = await getUserId();
-  const appId = await getProjectId($);
+  const apiKey = process.env.MEM0_API_KEY;
+  const mem0 = new Mem0HttpClient(baseUrl, apiKey);
   const branch = await getBranch($);
-  const stats = {adds: 0, searches: 0, messages: 0};
-  const sessionId = generateSessionId();
   const globalSearch = loadGlobalSearch();
 
-  let initialized = false;
-  let memoryCount = 0;
-  let msgCount = 0;
-
-  const systemContext: string[] = [];
-
-  // Auto-dream: gated memory-consolidation state (ported from the pi-agent plugin).
   const mem0StateDir = join(homedir(), ".mem0");
   const dreamConfig = loadDreamConfig(mem0StateDir);
-  let dreamTriggered = false;
-  let dreamWriteSeen = false;
+
+  const sessions = new Map<string, SessionState>();
+
+  // Resolve user_id for a specific OpenCode sessionID by fetching the session's
+  // projectID from the OpenCode server. Result is cached in the session-state
+  // map, so the lookup runs at most once per session ID.
+  async function resolveUserIdForSession(sessionID: string): Promise<string> {
+    if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+    try {
+      const res: any = await client.session.get({path: {id: sessionID}});
+      const info: any = res?.data ?? res;
+      const directory: string | undefined = info?.directory;
+      const projectID: string | undefined = info?.projectID;
+      const slug = projectSlug(directory, projectID);
+      if (slug) return `${getOsUser()}-${slug}`;
+    } catch {
+    }
+    return projectUserId(project);
+  }
+
+  async function getSessionState(sessionID: string): Promise<SessionState> {
+    let state = sessions.get(sessionID);
+    if (state) return state;
+    if (sessions.size >= SESSION_CACHE_MAX) {
+      const oldest = sessions.keys().next().value;
+      if (oldest !== undefined) sessions.delete(oldest);
+    }
+    const userId = await resolveUserIdForSession(sessionID);
+    state = {
+      userId,
+      runId: sessionID,
+      initialized: false,
+      memoryCount: 0,
+      msgCount: 0,
+      systemContext: [],
+      stats: {adds: 0, searches: 0, messages: 0},
+      dreamTriggered: false,
+      dreamWriteSeen: false,
+    };
+    sessions.set(sessionID, state);
+    return state;
+  }
 
   let dreamCleanupDone = false;
   const cleanupDream = () => {
     if (dreamCleanupDone) return;
     dreamCleanupDone = true;
-    // Finish an in-flight auto-dream: record completion if the agent consolidated,
-    // and always release the lock so the next eligible session can dream.
-    if (dreamTriggered) {
-      if (dreamWriteSeen) {
-        recordDreamCompletion(mem0StateDir);
+    // Any session that triggered a dream leaves the lock held; release once at
+    // process exit. The completion counter is best-effort per session that
+    // actually wrote during the dream.
+    let anyDream = false;
+    for (const state of sessions.values()) {
+      if (state.dreamTriggered) {
+        anyDream = true;
+        if (state.dreamWriteSeen) recordDreamCompletion(mem0StateDir);
       }
-      releaseDreamLock(mem0StateDir);
-      dreamTriggered = false;
     }
+    if (anyDream) releaseDreamLock(mem0StateDir);
   };
   try {
     process.on("beforeExit", cleanupDream);
   } catch {
   }
 
-  // Auto-configure coding categories in background (idempotent, never blocks)
-  Promise.resolve().then(() => autoSetupCategories(mem0, apiKey)).catch(() => {
-  });
+  function readScopeFilters(args: any, state: SessionState): Record<string, unknown> {
+    if (args.scope) return scopeSearchFilters(asScope(args.scope), state.userId, state.runId);
+    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, state.userId);
+    const ds = loadDefaultScope();
+    return ds === "project"
+      ? resolveFilters(args, globalSearch, state.userId)
+      : scopeSearchFilters(ds, state.userId, state.runId);
+  }
 
-  // Register a `/mem0-<skill>` slash command per bundled skill. OpenCode's TUI
-  // slash menu is populated from `config.command` entries (skills discovered via
-  // `skills.paths` are available to the agent's skill tool but do NOT appear as
-  // slash commands), so this is what makes `/mem0-scope` etc. typeable.
   function registerCommands(skillsDir: string, opencodeConfig: any) {
     for (const entry of readdirSync(skillsDir, {withFileTypes: true})) {
       if (!entry.isDirectory()) continue;
@@ -339,29 +282,12 @@ const Mem0Plugin: Plugin = async (ctx) => {
       opencodeConfig.command[entry.name] = {
         template: `Load and execute the \`${entry.name}\` skill.
 
-Use the mem0 memory tools (add_memory, search_memories, get_memories, get_memory, update_memory, delete_memory, delete_all_memories, delete_entities, list_entities, get_event_status) as instructed by the skill.
+Use the mem0 memory tools (add_memory, search_memories, get_memories, get_memory, update_memory, delete_memory, delete_all_memories, delete_entities, list_entities) as instructed by the skill.
 
-Identity context (resolved at plugin startup):
-- user_id: ${userId}
-- app_id: ${appId}
-- session_id: ${sessionId}
-- branch: ${branch}`,
+Identity is resolved per session — call /mem0-status to see the active user_id, run_id, and branch.`,
         description: desc,
       };
     }
-  }
-
-  // Resolve read filters for the memory tools. Precedence: an explicit `scope`
-  // arg wins; then explicit `filters`/`agent_id`; otherwise fall back to the
-  // user's persisted default scope (read fresh so /mem0-scope applies at once).
-  // A "project" default preserves the existing behavior, including global_search.
-  function readScopeFilters(args: any): any {
-    if (args.scope) return scopeSearchFilters(asScope(args.scope), userId, appId, sessionId);
-    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, userId, appId);
-    const ds = loadDefaultScope();
-    return ds === "project"
-      ? resolveFilters(args, globalSearch, userId, appId)
-      : scopeSearchFilters(ds, userId, appId, sessionId);
   }
 
   return {
@@ -372,20 +298,20 @@ Identity context (resolved at plugin startup):
     "experimental.session.compacting": compactionHook,
 
     "shell.env": async (
-      _input: { cwd: string; sessionID?: string },
+      input: { cwd: string; sessionID?: string },
       output: { env: Record<string, string> },
     ) => {
-      if (output?.env) {
-        output.env.MEM0_USER_ID = userId;
-        output.env.MEM0_APP_ID = appId;
-        output.env.MEM0_SESSION_ID = sessionId;
-        output.env.MEM0_BRANCH = branch;
-        output.env.MEM0_GLOBAL_SEARCH = globalSearch ? "true" : "false";
-      }
+      if (!output?.env) return;
+      const userId = input?.sessionID
+        ? (await getSessionState(input.sessionID)).userId
+        : projectUserId(project);
+      output.env.MEM0_USER_ID = userId;
+      if (input?.sessionID) output.env.MEM0_SESSION_ID = input.sessionID;
+      output.env.MEM0_BRANCH = branch;
+      output.env.MEM0_GLOBAL_SEARCH = globalSearch ? "true" : "false";
     },
 
     config: async (opencodeConfig: any) => {
-      // Point OpenCode at the plugin's OWN skills directory via `skills.paths`
       const here = import.meta.filename;
       const skillsDir = [
         resolve(dirname(dirname(here)), "opencode-skills"),
@@ -399,8 +325,6 @@ Identity context (resolved at plugin startup):
         opencodeConfig.skills.paths.push(skillsDir);
       }
 
-      // Register the /mem0-* slash commands (the TUI slash menu reads these from
-      // config.command; skills.paths alone does not create slash commands).
       registerCommands(skillsDir, opencodeConfig);
     },
 
@@ -409,26 +333,25 @@ Identity context (resolved at plugin startup):
         description: "Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something. Set infer to false to store the memory verbatim without LLM fact extraction.",
         args: {
           text: tool.schema.string().describe("Memory text content"),
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id which already encodes the project)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
           metadata: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Metadata key-value pairs"),
           infer: tool.schema.boolean().optional().describe("Set to false to store memory verbatim without LLM fact extraction"),
-          scope: tool.schema.string().optional().describe('Write scope: "project" (this repo, default), "session" (this run), or "global" (user-wide, all projects). Use "global" only when explicitly asked.')
+          scope: tool.schema.string().optional().describe('Write scope: "project" (this user_id, default), "session" (this run), or "global" (drop user_id, user-wide). Use "global" only when explicitly asked.')
         },
-        async execute(args) {
-          stats.adds++;
-          if (dreamTriggered) dreamWriteSeen = true;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          state.stats.adds++;
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
           const effScope: Scope = args.scope ? asScope(args.scope) : loadDefaultScope();
-          const sp = scopeWriteParams(effScope, userId, appId, sessionId);
+          const sp = scopeWriteParams(effScope, state.userId, state.runId);
           const finalUserId = args.agent_id ? args.user_id : (args.user_id ?? sp.user_id);
-          const finalAppId = args.app_id ?? sp.app_id;
 
           const meta = args.metadata ?? {};
           if (meta.confidence === undefined) meta.confidence = 0.7;
           if (!meta.source) meta.source = "opencode";
           if (!meta.type) meta.type = "task_learning";
-          if (!meta.session_id) meta.session_id = sessionId;
+          if (!meta.session_id) meta.session_id = state.runId;
           if (!meta.files) meta.files = ["*"];
           if (!meta.branch) meta.branch = branch;
 
@@ -437,17 +360,14 @@ Identity context (resolved at plugin startup):
             infer = false;
           }
 
-          const res = await mem0.add(
-            [{ role: "user", content: args.text }],
-            {
-              user_id: finalUserId,
-              app_id: finalAppId,
-              run_id: sp.run_id,
-              agent_id: args.agent_id,
-              metadata: meta,
-              infer
-            } as any
-          );
+          const res = await mem0.add({
+            messages: [{role: "user", content: args.text}],
+            user_id: finalUserId,
+            run_id: sp.run_id,
+            agent_id: args.agent_id,
+            metadata: meta,
+            infer,
+          });
           return JSON.stringify(res);
         }
       }),
@@ -456,22 +376,23 @@ Identity context (resolved at plugin startup):
         description: "Search stored memories by semantic meaning. Use this proactively before answering when the request may depend on the user's past work, preferences, decisions, or environment -- relevant memories are not always auto-injected. For multi-part or comparative questions, run several searches with different phrasings and combine the results rather than stopping after one (multi-hop).",
         args: {
           query: tool.schema.string().describe("Search query"),
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
-          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Key-value filters (e.g. metadata or user/app filters)"),
+          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Extra metadata filters, merged flat onto identity filters"),
           limit: tool.schema.number().optional().describe("Maximum number of results to return (top_k)"),
           top_k: tool.schema.number().optional().describe("Maximum number of results to return (alternative parameter)"),
-          scope: tool.schema.string().optional().describe('Search scope: "project" (this repo, default), "session" (this run only), or "global" (across ALL your projects). Only use "global" when the user explicitly asks to search across projects.'),
+          scope: tool.schema.string().optional().describe('Search scope: "project" (default), "session" (this run only), or "global" (drop user_id, server-wide). Only use "global" when the user explicitly asks.'),
         },
-        async execute(args) {
-          stats.searches++;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          state.stats.searches++;
           const topK = args.limit ?? args.top_k ?? 10;
-          const filters = readScopeFilters(args);
+          const filters = readScopeFilters(args, state);
 
-          const res = await mem0.search(args.query, {
+          const res = await mem0.search({
+            query: args.query,
             filters,
-            topK,
+            top_k: topK,
           });
           return JSON.stringify(res);
         }
@@ -480,21 +401,21 @@ Identity context (resolved at plugin startup):
       get_memories: tool({
         description: "List or browse stored memories without a search query -- useful for auditing what is remembered or paging through everything in a scope. To find memories relevant to a question, use search_memories instead (it ranks by semantic relevance).",
         args: {
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
-          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Metadata/identity filters"),
-          page: tool.schema.number().optional().describe("Page number"),
-          page_size: tool.schema.number().optional().describe("Page size"),
-          scope: tool.schema.string().optional().describe('Scope: "project" (default), "session", or "global" (across ALL your projects). Use "global" only when explicitly asked.'),
+          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Extra metadata filters (informational; the server list endpoint honors identity + top_k only)"),
+          page: tool.schema.number().optional().describe("Page number (ignored — server has no pagination)"),
+          page_size: tool.schema.number().optional().describe("Page size, mapped to top_k"),
+          scope: tool.schema.string().optional().describe('Scope: "project" (default), "session", or "global" (drop user_id, server-wide). Use "global" only when explicitly asked.'),
         },
-        async execute(args) {
-          const filters = readScopeFilters(args);
-
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          const scoped = readScopeFilters(args, state);
           const res = await mem0.getAll({
-            page: args.page,
-            pageSize: args.page_size,
-            filters,
+            user_id: (scoped.user_id as string) ?? undefined,
+            agent_id: (scoped.agent_id as string) ?? undefined,
+            run_id: (scoped.run_id as string) ?? undefined,
+            top_k: args.page_size,
           });
           return JSON.stringify(res);
         }
@@ -532,8 +453,9 @@ Identity context (resolved at plugin startup):
         args: {
           id: tool.schema.string().describe("The ID of the memory to delete"),
         },
-        async execute(args) {
-          if (dreamTriggered) dreamWriteSeen = true;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
           const res = await mem0.delete(args.id);
           return JSON.stringify(res);
         }
@@ -543,97 +465,80 @@ Identity context (resolved at plugin startup):
         description: "Delete ALL memories in the given scope. Destructive and irreversible -- only use when the user explicitly asks to wipe their memory. Never call speculatively.",
         args: {
           user_id: tool.schema.string().optional().describe("User ID whose memories to delete"),
-          app_id: tool.schema.string().optional().describe("App ID whose memories to delete"),
           agent_id: tool.schema.string().optional().describe("Agent ID whose memories to delete"),
           scope: tool.schema.string().optional().describe('Scope to delete: "project" (default), "session", or "global" (user-wide). Use "global" only when explicitly asked.'),
         },
-        async execute(args) {
-          if (dreamTriggered) dreamWriteSeen = true;
-          const sp = args.scope ? scopeWriteParams(asScope(args.scope), userId, appId, sessionId) : null;
+        async execute(args, tctx) {
+          const state = await getSessionState(tctx.sessionID);
+          if (state.dreamTriggered) state.dreamWriteSeen = true;
+          const sp = args.scope ? scopeWriteParams(asScope(args.scope), state.userId, state.runId) : null;
           const res = await mem0.deleteAll({
-            user_id: sp ? sp.user_id : (args.agent_id ? args.user_id : (args.user_id ?? userId)),
-            app_id: sp ? sp.app_id : (args.app_id ?? appId),
+            user_id: sp ? sp.user_id : (args.agent_id ? args.user_id : (args.user_id ?? state.userId)),
             run_id: sp?.run_id,
             agent_id: args.agent_id,
-          } as any);
+          });
           return JSON.stringify(res);
         }
       }),
 
       delete_entities: tool({
-        description: "Delete entire user/agent/app/run entities and every memory attached to them. Destructive and irreversible -- only on explicit user request to remove a whole user, agent, or project.",
+        description: "Delete a user/agent/run entity and every memory attached to it. Destructive and irreversible -- only on explicit user request to remove a whole user, agent, or run. Pass EXACTLY ONE of user_id/agent_id/run_id.",
         args: {
           user_id: tool.schema.string().optional().describe("User ID of the entity to delete"),
           agent_id: tool.schema.string().optional().describe("Agent ID of the entity to delete"),
-          app_id: tool.schema.string().optional().describe("App/Project ID of the entity to delete"),
           run_id: tool.schema.string().optional().describe("Run ID of the entity to delete"),
         },
         async execute(args) {
-          const res = await mem0.deleteUsers({
-            userId: args.user_id,
-            agentId: args.agent_id,
-            appId: args.app_id,
-            runId: args.run_id,
-          });
-          return JSON.stringify(res);
+          if (args.user_id) return JSON.stringify(await mem0.deleteEntity("user", args.user_id));
+          if (args.agent_id) return JSON.stringify(await mem0.deleteEntity("agent", args.agent_id));
+          if (args.run_id) return JSON.stringify(await mem0.deleteEntity("run", args.run_id));
+          throw new Error("delete_entities: pass exactly one of user_id / agent_id / run_id");
         }
       }),
 
       list_entities: tool({
-        description: "List the user/agent/app/run entities that have memories. Use to discover which scopes exist before searching, listing, or deleting within a specific one.",
+        description: "List the user/agent/run entities that have memories. Use to discover which scopes exist before searching, listing, or deleting within a specific one. `page`/`page_size` slice the result client-side (self-hosted server returns the full list).",
         args: {
-          page: tool.schema.number().optional().describe("Page number"),
-          page_size: tool.schema.number().optional().describe("Page size"),
+          page: tool.schema.number().optional().describe("Page number (1-based, client-side slice)"),
+          page_size: tool.schema.number().optional().describe("Page size (default 50, client-side slice)"),
         },
         async execute(args) {
-          const res = await mem0.users({
-            page: args.page,
-            pageSize: args.page_size,
-          });
-          return JSON.stringify(res);
-        }
-      }),
-
-      get_event_status: tool({
-        description: "Check whether an asynchronous memory write (add/update/delete) finished, using the event_id that call returned. Poll this when you need to confirm a write was persisted before relying on it.",
-        args: {
-          event_id: tool.schema.string().describe("The ID of the event/async operation to check"),
-        },
-        async execute(args) {
-          const response = await mem0.client.get(`/v1/event/${args.event_id}/`);
-          return JSON.stringify(response.data);
+          const all = await mem0.entities();
+          const pageSize = args.page_size ?? 50;
+          const page = args.page ?? 1;
+          const start = (page - 1) * pageSize;
+          const results = all.slice(start, start + pageSize);
+          return JSON.stringify({results, page, page_size: pageSize, total: all.length});
         }
       }),
     },
   };
 
-  async function chatMessageHook(input: any, output: any) {
+  async function chatMessageHook(input: {sessionID: string}, output: any) {
     const userText = extractUserText(input, output);
     if (!userText || userText.length < 10) return;
 
+    const state = await getSessionState(input.sessionID);
+    const {userId, runId} = state;
     const safeText = redact(userText);
-    msgCount++;
-    stats.messages++;
+    state.msgCount++;
+    state.stats.messages++;
 
-    if (!initialized) {
-      initialized = true;
+    if (!state.initialized) {
+      state.initialized = true;
 
       if (dreamConfig.enabled) {
-        incrementSessionCount(mem0StateDir, sessionId);
+        incrementSessionCount(mem0StateDir, runId);
       }
 
-      const searchFilters = globalSearch
-        ? {OR: [{user_id: "*"}]}
-        : {AND: [{user_id: userId}, {app_id: appId}]};
+      const searchFilters: Record<string, unknown> = globalSearch
+        ? {}
+        : {user_id: userId};
 
       try {
-        const all = await mem0.getAll({
-          filters: searchFilters,
-          page: 1,
-          pageSize: 1,
-        });
+        const all = await mem0.getAll(globalSearch ? {} : {user_id: userId});
         const a: any = all;
-        memoryCount =
+        state.memoryCount =
           typeof a?.count === "number"
             ? a.count
             : Array.isArray(a)
@@ -643,53 +548,51 @@ Identity context (resolved at plugin startup):
                 : 0;
 
         if (globalSearch) {
-          systemContext.push(
-            `Global search is ON — searches return all memories across all users and projects. Writes still use user_id="${userId}", app_id="${appId}".`,
+          state.systemContext.push(
+            `Global search is ON — searches drop the user_id filter (server-wide). Writes still use user_id="${userId}".`,
           );
         } else {
-          systemContext.push(
-            `Always include user_id="${userId}" and app_id="${appId}" in every search_memories filter and add_memory call.`,
+          state.systemContext.push(
+            `Always include user_id="${userId}" in every search_memories filter and add_memory call.`,
           );
         }
 
-        if (memoryCount === 0) {
-          systemContext.push(
+        if (state.memoryCount === 0) {
+          state.systemContext.push(
             "New project with 0 memories. Capture decisions, conventions, and learnings as you work via the add_memory tool or the remember skill.",
           );
         }
 
-        if (memoryCount > 0) {
-          systemContext.push(
+        if (state.memoryCount > 0) {
+          state.systemContext.push(
             "Search mem0 for recent decisions and task learnings before responding. Run 2 parallel searches: one for decision type, one for task_learning type.",
           );
           try {
-            const res = await mem0.search(
-              "recent session state decisions and learnings",
-              {
-                filters: searchFilters,
-                topK: 5,
-              },
-            );
-            stats.searches++;
+            const res = await mem0.search({
+              query: "recent session state decisions and learnings",
+              filters: searchFilters,
+              top_k: 5,
+            });
+            state.stats.searches++;
             const memories = extractMemories(res);
             if (memories.length > 0) {
               const memLines = memories
                 .map((m) => `- ${m.memory}`)
                 .join("\n");
-              systemContext.push(`Prior context from mem0:\n${memLines}`);
+              state.systemContext.push(`Prior context from mem0:\n${memLines}`);
             }
           } catch {
           }
         }
 
-        systemContext.push(
-          "Mem0 searches apply when user references past work, decision questions, errors, or non-trivial tasks. Queries use noun-phrases, 2-4 parallel calls with different metadata.type filters, and include user_id + app_id.",
+        state.systemContext.push(
+          "Mem0 searches apply when user references past work, decision questions, errors, or non-trivial tasks. Queries use noun-phrases, 2-4 parallel calls with different metadata.type filters, and include the current user_id.",
         );
-        systemContext.push(SCOPE_GUIDANCE);
+        state.systemContext.push(SCOPE_GUIDANCE);
         const activeScope = loadDefaultScope();
         if (activeScope !== "project") {
-          systemContext.push(
-            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${sessionId}"); "global" spans all your projects (app_id="*"). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
+          state.systemContext.push(
+            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${runId}"); "global" drops user_id from the filter (server-wide). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
           );
         }
       } catch (err: any) {
@@ -705,16 +608,13 @@ Identity context (resolved at plugin startup):
         }
       }
 
-      // Auto-dream: when the time/session/memory gates pass, inject the
-      // consolidation protocol so the agent tidies memories before answering.
-      if (dreamConfig.enabled && dreamConfig.auto && !dreamTriggered) {
+      if (dreamConfig.enabled && dreamConfig.auto && !state.dreamTriggered) {
         const gates = checkCheapGates(mem0StateDir, dreamConfig);
-        const memGate = checkMemoryGate(memoryCount, dreamConfig);
+        const memGate = checkMemoryGate(state.memoryCount, dreamConfig);
         if (gates.proceed && memGate.pass && acquireDreamLock(mem0StateDir)) {
-          dreamTriggered = true;
-          systemContext.push(DREAM_PROTOCOL);
+          state.dreamTriggered = true;
+          state.systemContext.push(DREAM_PROTOCOL);
         } else {
-          // Make "why didn't auto-dream run?" answerable from the logs.
           const waiting = [gates.reason, memGate.reason].filter(Boolean).join("; ");
           if (waiting) {
             try {
@@ -730,7 +630,7 @@ Identity context (resolved at plugin startup):
 
     const hasRemember = NUDGE_RE.test(safeText);
     if (hasRemember) {
-      systemContext.push(
+      state.systemContext.push(
         "[MEMORY TRIGGER] User asked to remember something. Call add_memory with the user's statement, confidence=1.0, infer=false.",
       );
     }
@@ -738,25 +638,14 @@ Identity context (resolved at plugin startup):
     const hasResume = RESUME_RE.test(safeText);
     if (hasResume) {
       try {
-        const resumeFilters = globalSearch
-          ? {OR: [{user_id: "*"}]}
-          : {
-            AND: [
-              {user_id: userId},
-              {app_id: appId},
-            ],
-          };
+        const resumeFilters: Record<string, unknown> = globalSearch
+          ? {}
+          : {user_id: userId};
         const [stateRes, decisionsRes] = await Promise.all([
-          mem0.search("session state current task", {
-            filters: resumeFilters,
-            topK: 3,
-          }),
-          mem0.search("recent decisions and learnings", {
-            filters: resumeFilters,
-            topK: 3,
-          }),
+          mem0.search({query: "session state current task", filters: resumeFilters, top_k: 3}),
+          mem0.search({query: "recent decisions and learnings", filters: resumeFilters, top_k: 3}),
         ]);
-        stats.searches += 2;
+        state.stats.searches += 2;
         const all = [
           ...extractMemories(stateRes),
           ...extractMemories(decisionsRes),
@@ -769,7 +658,7 @@ Identity context (resolved at plugin startup):
         });
         if (unique.length > 0) {
           const memLines = unique.map((m) => `- ${m.memory}`).join("\n");
-          systemContext.push(
+          state.systemContext.push(
             `Session resume context:\n${memLines}\n\nThese memories provide context for resuming work.`,
           );
         }
@@ -777,48 +666,46 @@ Identity context (resolved at plugin startup):
       }
     }
 
-    if (!hasResume && memoryCount > 0) {
+    if (!hasResume && state.memoryCount > 0) {
       try {
-        const msgFilters = globalSearch
-          ? {OR: [{user_id: "*"}]}
-          : {AND: [{user_id: userId}, {app_id: appId}]};
-        const res = await mem0.search(safeText, {
-          filters: msgFilters,
-          topK: 5,
-        });
-        stats.searches++;
+        const msgFilters: Record<string, unknown> = globalSearch
+          ? {}
+          : {user_id: userId};
+        const res = await mem0.search({query: safeText, filters: msgFilters, top_k: 5});
+        state.stats.searches++;
         const memories = extractMemories(res);
         if (memories.length > 0) {
           const memLines = memories.map((m) => `- ${m.memory}`).join("\n");
-          systemContext.push(`Relevant memories:\n${memLines}`);
+          state.systemContext.push(`Relevant memories:\n${memLines}`);
         }
       } catch {
       }
     }
 
-    if (msgCount % 3 === 0) {
+    if (state.msgCount % 3 === 0) {
       Promise.resolve().then(async () => {
         try {
-          await mem0.add([{role: "user", content: safeText}], {
+          await mem0.add({
+            messages: [{role: "user", content: safeText}],
             user_id: userId,
-            app_id: appId,
+            run_id: runId,
             metadata: {
               type: "auto_capture",
               source: "opencode",
               confidence: 0.7,
-              session_id: sessionId,
+              session_id: runId,
               branch,
             },
             infer: true,
-          } as any);
-          stats.adds++;
+          });
+          state.stats.adds++;
         } catch {
         }
       });
     }
 
-    if (msgCount % 5 === 0 && stats.adds < Math.floor(msgCount / 3)) {
-      systemContext.push(
+    if (state.msgCount % 5 === 0 && state.stats.adds < Math.floor(state.msgCount / 3)) {
+      state.systemContext.push(
         "After responding, store any new decisions, learnings, or preferences from this exchange via add_memory. Keep it to 1 sentence per memory.",
       );
     }
@@ -841,7 +728,14 @@ Identity context (resolved at plugin startup):
   }
 
   async function chatMessagesTransformHook(_input: any, output: { messages: { info: any; parts: any[] }[] }) {
-    if (systemContext.length === 0 || !output?.messages?.length) return;
+    if (!output?.messages?.length) return;
+    // messages.transform has no sessionID in `input`; pull it off the first
+    // message's info so we inject the CORRECT session's systemContext when
+    // multiple projects share one OpenCode process.
+    const sessionID: string | undefined = output.messages[0]?.info?.sessionID;
+    if (!sessionID) return;
+    const state = sessions.get(sessionID);
+    if (!state || state.systemContext.length === 0) return;
 
     const firstUser = output.messages.find(
       (m) => m.info.role === "user",
@@ -851,7 +745,7 @@ Identity context (resolved at plugin startup):
     const marker = "## Mem0 Memory Context";
     if (firstUser.parts.some((p: any) => p.type === "text" && p.text?.includes(marker))) return;
 
-    const block = `${marker}\n\n${systemContext.join("\n\n")}`;
+    const block = `${marker}\n\n${state.systemContext.join("\n\n")}`;
     const ref = firstUser.parts[0];
     firstUser.parts.unshift({...ref, type: "text", text: block});
   }
@@ -859,6 +753,8 @@ Identity context (resolved at plugin startup):
   async function toolExecuteAfterHook(input: any, _output: any) {
     const toolName: string = input?.tool ?? "";
     const toolOutput: string = input?.output ?? _output?.output ?? "";
+    const sessionID: string | undefined = input?.sessionID;
+    if (!sessionID) return;
 
     if (toolName === "bash" && toolOutput.length >= 50) {
       const command: string = input?.args?.command ?? "";
@@ -869,6 +765,7 @@ Identity context (resolved at plugin startup):
       if (!hasStrongError && multiErrors < 2) return;
 
       try {
+        const state = await getSessionState(sessionID);
         const errorLine =
           toolOutput
             .split("\n")
@@ -889,19 +786,15 @@ Identity context (resolved at plugin startup):
         const errorQuery = errorLine.slice(0, 80);
         if (errorQuery.length < 10) return;
 
-        const errorFilters = globalSearch
-          ? {OR: [{user_id: "*"}]}
-          : {
-            AND: [
-              {user_id: userId},
-              {app_id: appId},
-            ],
-          };
-        const res = await mem0.search(`error: ${errorQuery}`, {
+        const errorFilters: Record<string, unknown> = globalSearch
+          ? {}
+          : {user_id: state.userId};
+        const res = await mem0.search({
+          query: `error: ${errorQuery}`,
           filters: errorFilters,
-          topK: 6,
+          top_k: 6,
         });
-        stats.searches++;
+        state.stats.searches++;
         const unique = extractMemories(res);
 
         let ctx = `Error detected: \`${command.slice(0, 100)}\` produced:\n> ${errorLine}`;
@@ -914,39 +807,44 @@ Identity context (resolved at plugin startup):
         }
         ctx +=
           "\nStore resolved errors as anti_pattern or bug_fix memories for future reference.";
-        systemContext.push(ctx);
+        state.systemContext.push(ctx);
       } catch {
       }
     }
   }
 
   async function compactionHook(input: { sessionID?: string }, output: { context: string[]; prompt?: string }) {
+    const sessionID = input?.sessionID;
+    if (!sessionID) return;
     try {
-      const compactSessionId = input?.sessionID ?? sessionId;
-      const summaryContent = `Session compacting. Project: ${appId}. Branch: ${branch}. Session: ${compactSessionId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
+      const state = await getSessionState(sessionID);
+      const {userId, runId, stats} = state;
+      const summaryContent = `Session compacting. User: ${userId}. Branch: ${branch}. Session: ${runId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
       Promise.resolve().then(async () => {
         try {
-          await mem0.add([{role: "user", content: summaryContent}], {
+          await mem0.add({
+            messages: [{role: "user", content: summaryContent}],
             user_id: userId,
-            app_id: appId,
+            run_id: runId,
             metadata: {
               type: "session_state",
               source: "pre-compaction",
-              session_id: compactSessionId,
+              session_id: runId,
               branch,
             },
             infer: true,
-          } as any);
+          });
         } catch {
         }
       });
 
-      const compactFilters = globalSearch
-        ? {OR: [{user_id: "*"}]}
-        : {AND: [{user_id: userId}, {app_id: appId}]};
-      const res = await mem0.search("session state decisions learnings", {
+      const compactFilters: Record<string, unknown> = globalSearch
+        ? {}
+        : {user_id: userId};
+      const res = await mem0.search({
+        query: "session state decisions learnings",
         filters: compactFilters,
-        topK: 10,
+        top_k: 10,
       });
       const memories = extractMemories(res);
       if (memories.length > 0 && output?.context) {
