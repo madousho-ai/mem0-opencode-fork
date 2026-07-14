@@ -5,13 +5,14 @@
 // client (client.ts), NOT the cloud `mem0ai` SDK — the cloud SDK targets the
 // hosted platform and its extras (customCategories, event queue, AND/OR
 // filters, top-level app_id) that the self-hosted server does not implement.
-// Project isolation is achieved by folding the repo name into `user_id` at
-// startup (see getUserId), so the server's flat identity model is enough.
-import type {Plugin} from "@opencode-ai/plugin";
+// Project isolation is achieved by folding the OpenCode project id into
+// `user_id` at startup (see getUserId), so the server's flat identity model
+// is enough.
+import type {Plugin, PluginInput} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import {Mem0HttpClient} from "./client";
 import {userInfo} from "os";
-import {basename, resolve, dirname} from "path";
+import {resolve, dirname} from "path";
 import {randomBytes} from "crypto";
 import {existsSync, readFileSync, readdirSync} from "fs";
 import {homedir} from "os";
@@ -27,25 +28,8 @@ import {
   DREAM_PROTOCOL,
 } from "./dream";
 import {asScope, scopeSearchFilters, scopeWriteParams, resolveDefaultScope, SCOPE_GUIDANCE, type Scope} from "./scope";
-import {parseProjectFromRemote} from "./project";
 
-async function detectProject($: any): Promise<string> {
-  try {
-    const r = await $`git remote get-url origin`.quiet();
-    const project = parseProjectFromRemote(r.stdout.toString());
-    if (project) return project;
-  } catch {
-  }
-  try {
-    const r = await $`git rev-parse --show-toplevel`.quiet();
-    const top = r.stdout.toString().trim();
-    if (top) return basename(top);
-  } catch {
-  }
-  return basename(process.cwd());
-}
-
-async function getUserId($: any): Promise<string> {
+function getUserId(project: PluginInput["project"]): string {
   if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
   let osUser: string;
   try {
@@ -53,11 +37,11 @@ async function getUserId($: any): Promise<string> {
   } catch {
     osUser = process.env.USER || process.env.USERNAME || "unknown";
   }
-  // Self-hosted server has no `app_id` field. Fold the project name into the
-  // user_id so each repo has its own memory bucket by default; users who want
+  // Self-hosted server has no `app_id` field. Fold the OpenCode project id
+  // (stable across branches, worktrees, and vcs churn) into user_id so each
+  // OpenCode project has its own memory bucket by default. Users who want
   // cross-project memory set MEM0_USER_ID to a bare identifier.
-  const project = await detectProject($);
-  return project ? `${osUser}-${project}` : osUser;
+  return project?.id ? `${osUser}-${project.id}` : osUser;
 }
 
 async function getBranch($: any): Promise<string> {
@@ -161,7 +145,7 @@ function extractUserText(input: any, output: any): string {
 }
 
 const Mem0Plugin: Plugin = async (ctx) => {
-  const {$, client} = ctx;
+  const {$, client, project} = ctx;
 
   const baseUrl = process.env.MEM0_API_BASE_URL;
   if (!baseUrl) {
@@ -181,7 +165,7 @@ const Mem0Plugin: Plugin = async (ctx) => {
 
   const apiKey = process.env.MEM0_API_KEY;
   const mem0 = new Mem0HttpClient(baseUrl, apiKey);
-  const userId = await getUserId($);
+  const userId = getUserId(project);
   const branch = await getBranch($);
   const stats = {adds: 0, searches: 0, messages: 0};
   const sessionId = generateSessionId();

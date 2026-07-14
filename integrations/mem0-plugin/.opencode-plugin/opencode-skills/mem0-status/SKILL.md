@@ -35,7 +35,7 @@ _SCOPE="$(grep -o '"default_scope"[[:space:]]*:[[:space:]]*"[a-z]*"' "$_S" 2>/de
 echo "default_scope=${_SCOPE:-project}"
 ```
 
-- `user_id`: from `MEM0_USER_ID` (the plugin encodes the repo name into this by default — e.g. `alice-owner-repo`)
+- `user_id`: from `MEM0_USER_ID` (the plugin encodes the OpenCode project id into this by default — e.g. `alice-a1b2c3d4`)
 - `branch`: from `MEM0_BRANCH` (the plugin's resolved value; falls back to `main` outside a git repo)
 - `default_scope`: from `~/.mem0/settings.json` (`default_scope`), falling back to `project`. This is the scope memory tools use when none is given; change it with `/mem0-scope`.
 
@@ -115,11 +115,11 @@ Report:
 ## mem0 status
 
 PASS  Server          http://localhost:8888 (m0sk_...)
-PASS  Identity        user_id=alice-owner-repo, branch=main
+PASS  Identity        user_id=alice-a1b2c3d4, branch=main
 PASS  Default scope   project
 PASS  Memory Tools    142ms
 PASS  Write/Read      write + delete OK
-PASS  Session         session_id=abc123, user_id=alice-owner-repo, branch=main
+PASS  Session         session_id=abc123, user_id=alice-a1b2c3d4, branch=main
 WARN  Auto-dream      waiting — sessions 2/5, memories 3/20 (/mem0-dream to run now)
 
 All checks passed.

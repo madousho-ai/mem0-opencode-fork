@@ -114,7 +114,7 @@ First show the category summary table:
 mem0 tour
 
 Session (ses_abc123)  branch: main
-User: alice-owner-repo  -  349 memories
+User: alice-a1b2c3d4  -  349 memories
 
 Category                   Count
 -----------------------------------------

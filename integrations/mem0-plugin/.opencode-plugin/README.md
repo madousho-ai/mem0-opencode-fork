@@ -52,8 +52,9 @@ API-compatible with the cloud plugin:
 
 ## Identity & scope
 
-- `user_id` — **defaults to `<os_user>-<git_project>`** (auto-detected from the
-  git remote or repo root name). This is how per-repo isolation is achieved on
+- `user_id` — **defaults to `<os_user>-<opencode_project_id>`** (the OpenCode
+  project id is exposed by the plugin runtime and is stable across branches,
+  worktrees, and vcs changes). This is how per-project isolation is achieved on
   a server that has no `app_id` field.
 - Set `MEM0_USER_ID` to override — e.g. `MEM0_USER_ID=alice` to share memory
   across every repo you touch.
