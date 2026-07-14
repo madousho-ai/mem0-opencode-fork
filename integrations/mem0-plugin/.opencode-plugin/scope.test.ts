@@ -1,38 +1,26 @@
 import { describe, expect, test } from "bun:test";
 import { scopeSearchFilters, scopeWriteParams, asScope, resolveDefaultScope } from "./scope";
 
-describe("memory scope (pi-agent parity)", () => {
-  test("project scope = this repo", () => {
-    expect(scopeSearchFilters("project", "u", "app", "run")).toEqual({
-      user_id: "u",
-      app_id: "app",
-    });
-    expect(scopeWriteParams("project", "u", "app", "run")).toEqual({
-      user_id: "u",
-      app_id: "app",
-    });
+describe("memory scope (self-hosted)", () => {
+  test("project scope = current user_id", () => {
+    expect(scopeSearchFilters("project", "u", "run")).toEqual({ user_id: "u" });
+    expect(scopeWriteParams("project", "u", "run")).toEqual({ user_id: "u" });
   });
 
   test("session scope adds run_id", () => {
-    expect(scopeSearchFilters("session", "u", "app", "run")).toEqual({
+    expect(scopeSearchFilters("session", "u", "run")).toEqual({
       user_id: "u",
-      app_id: "app",
       run_id: "run",
     });
-    expect(scopeWriteParams("session", "u", "app", "run")).toEqual({
+    expect(scopeWriteParams("session", "u", "run")).toEqual({
       user_id: "u",
-      app_id: "app",
       run_id: "run",
     });
   });
 
-  test("global scope spans all the user's projects (matches pi-agent)", () => {
-    expect(scopeSearchFilters("global", "u", "app", "run")).toEqual({
-      user_id: "u",
-      app_id: "*",
-    });
-    // global writes drop app_id so the memory is user-wide, not project-bound
-    expect(scopeWriteParams("global", "u", "app", "run")).toEqual({ user_id: "u" });
+  test("global scope drops user_id (server-wide)", () => {
+    expect(scopeSearchFilters("global", "u", "run")).toEqual({});
+    expect(scopeWriteParams("global", "u", "run")).toEqual({});
   });
 
   test("default scope is project when settings are absent", () => {

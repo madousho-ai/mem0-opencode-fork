@@ -3,8 +3,10 @@
 // (mem0-opencode-fork/server/), wired through OpenCode plugin hooks. Memory
 // operations are exposed as native OpenCode tools backed by our own thin HTTP
 // client (client.ts), NOT the cloud `mem0ai` SDK — the cloud SDK targets the
-// hosted platform and its extras (app_id, customCategories, event queue,
-// AND/OR filters) that the self-hosted server does not implement.
+// hosted platform and its extras (customCategories, event queue, AND/OR
+// filters, top-level app_id) that the self-hosted server does not implement.
+// Project isolation is achieved by folding the repo name into `user_id` at
+// startup (see getUserId), so the server's flat identity model is enough.
 import type {Plugin} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import {Mem0HttpClient} from "./client";
@@ -27,27 +29,13 @@ import {
 import {asScope, scopeSearchFilters, scopeWriteParams, resolveDefaultScope, SCOPE_GUIDANCE, type Scope} from "./scope";
 import {parseProjectFromRemote} from "./project";
 
-async function getUserId(): Promise<string> {
-  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
-  try {
-    return userInfo().username;
-  } catch {
-  }
-  return process.env.USER || process.env.USERNAME || "unknown";
-}
-
-async function getProjectId($: any): Promise<string> {
-  if (process.env.MEM0_APP_ID) return process.env.MEM0_APP_ID;
-  // Prefer the git remote's owner/repo — stable across clones, worktrees, and
-  // sub-directories (handles https + ssh, incl. custom host aliases).
+async function detectProject($: any): Promise<string> {
   try {
     const r = await $`git remote get-url origin`.quiet();
     const project = parseProjectFromRemote(r.stdout.toString());
     if (project) return project;
   } catch {
   }
-  // No usable remote: use the git repo ROOT dir name, not cwd (which may be a
-  // sub-directory, or your home dir if OpenCode was launched outside a repo).
   try {
     const r = await $`git rev-parse --show-toplevel`.quiet();
     const top = r.stdout.toString().trim();
@@ -55,6 +43,21 @@ async function getProjectId($: any): Promise<string> {
   } catch {
   }
   return basename(process.cwd());
+}
+
+async function getUserId($: any): Promise<string> {
+  if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
+  let osUser: string;
+  try {
+    osUser = userInfo().username;
+  } catch {
+    osUser = process.env.USER || process.env.USERNAME || "unknown";
+  }
+  // Self-hosted server has no `app_id` field. Fold the project name into the
+  // user_id so each repo has its own memory bucket by default; users who want
+  // cross-project memory set MEM0_USER_ID to a bare identifier.
+  const project = await detectProject($);
+  return project ? `${osUser}-${project}` : osUser;
 }
 
 async function getBranch($: any): Promise<string> {
@@ -130,16 +133,13 @@ const ERROR_STRONG_RE =
 const ERROR_MULTI_RE = /(Error:|Exception:)/g;
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "write", "edit", "multiEdit"]);
 
-function resolveFilters(args: any, globalSearch: boolean, userId: string, appId: string): Record<string, unknown> {
-  // Self-hosted server passes `filters` straight through to mem0 OSS which only
-  // understands flat metadata equality — no AND/OR trees, no user_id="*".
+function resolveFilters(args: any, globalSearch: boolean, userId: string): Record<string, unknown> {
   const base: Record<string, unknown> = {};
   if (args.agent_id) {
     base.agent_id = args.agent_id;
   } else if (!globalSearch) {
     base.user_id = args.user_id ?? userId;
   }
-  base.app_id = args.app_id ?? appId;
   if (args.filters && typeof args.filters === "object") {
     return {...base, ...(args.filters as Record<string, unknown>)};
   }
@@ -181,8 +181,7 @@ const Mem0Plugin: Plugin = async (ctx) => {
 
   const apiKey = process.env.MEM0_API_KEY;
   const mem0 = new Mem0HttpClient(baseUrl, apiKey);
-  const userId = await getUserId();
-  const appId = await getProjectId($);
+  const userId = await getUserId($);
   const branch = await getBranch($);
   const stats = {adds: 0, searches: 0, messages: 0};
   const sessionId = generateSessionId();
@@ -242,7 +241,6 @@ Use the mem0 memory tools (add_memory, search_memories, get_memories, get_memory
 
 Identity context (resolved at plugin startup):
 - user_id: ${userId}
-- app_id: ${appId}
 - session_id: ${sessionId}
 - branch: ${branch}`,
         description: desc,
@@ -250,17 +248,13 @@ Identity context (resolved at plugin startup):
     }
   }
 
-  // Resolve read filters for the memory tools. Precedence: an explicit `scope`
-  // arg wins; then explicit `filters`/`agent_id`; otherwise fall back to the
-  // user's persisted default scope (read fresh so /mem0-scope applies at once).
-  // A "project" default preserves the existing behavior, including global_search.
   function readScopeFilters(args: any): any {
-    if (args.scope) return scopeSearchFilters(asScope(args.scope), userId, appId, sessionId);
-    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, userId, appId);
+    if (args.scope) return scopeSearchFilters(asScope(args.scope), userId, sessionId);
+    if (args.filters || args.agent_id) return resolveFilters(args, globalSearch, userId);
     const ds = loadDefaultScope();
     return ds === "project"
-      ? resolveFilters(args, globalSearch, userId, appId)
-      : scopeSearchFilters(ds, userId, appId, sessionId);
+      ? resolveFilters(args, globalSearch, userId)
+      : scopeSearchFilters(ds, userId, sessionId);
   }
 
   return {
@@ -276,7 +270,6 @@ Identity context (resolved at plugin startup):
     ) => {
       if (output?.env) {
         output.env.MEM0_USER_ID = userId;
-        output.env.MEM0_APP_ID = appId;
         output.env.MEM0_SESSION_ID = sessionId;
         output.env.MEM0_BRANCH = branch;
         output.env.MEM0_GLOBAL_SEARCH = globalSearch ? "true" : "false";
@@ -308,20 +301,18 @@ Identity context (resolved at plugin startup):
         description: "Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something. Set infer to false to store the memory verbatim without LLM fact extraction.",
         args: {
           text: tool.schema.string().describe("Memory text content"),
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id which already encodes the project)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
           metadata: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Metadata key-value pairs"),
           infer: tool.schema.boolean().optional().describe("Set to false to store memory verbatim without LLM fact extraction"),
-          scope: tool.schema.string().optional().describe('Write scope: "project" (this repo, default), "session" (this run), or "global" (user-wide, all projects). Use "global" only when explicitly asked.')
+          scope: tool.schema.string().optional().describe('Write scope: "project" (this user_id, default), "session" (this run), or "global" (drop user_id, user-wide). Use "global" only when explicitly asked.')
         },
         async execute(args) {
           stats.adds++;
           if (dreamTriggered) dreamWriteSeen = true;
           const effScope: Scope = args.scope ? asScope(args.scope) : loadDefaultScope();
-          const sp = scopeWriteParams(effScope, userId, appId, sessionId);
+          const sp = scopeWriteParams(effScope, userId, sessionId);
           const finalUserId = args.agent_id ? args.user_id : (args.user_id ?? sp.user_id);
-          const finalAppId = args.app_id ?? sp.app_id;
 
           const meta = args.metadata ?? {};
           if (meta.confidence === undefined) meta.confidence = 0.7;
@@ -336,7 +327,6 @@ Identity context (resolved at plugin startup):
             infer = false;
           }
 
-          if (finalAppId) meta.app_id = finalAppId;
           const res = await mem0.add({
             messages: [{role: "user", content: args.text}],
             user_id: finalUserId,
@@ -353,13 +343,12 @@ Identity context (resolved at plugin startup):
         description: "Search stored memories by semantic meaning. Use this proactively before answering when the request may depend on the user's past work, preferences, decisions, or environment -- relevant memories are not always auto-injected. For multi-part or comparative questions, run several searches with different phrasings and combine the results rather than stopping after one (multi-hop).",
         args: {
           query: tool.schema.string().describe("Search query"),
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
-          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Key-value filters (e.g. metadata or user/app filters)"),
+          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Extra metadata filters, merged flat onto identity filters"),
           limit: tool.schema.number().optional().describe("Maximum number of results to return (top_k)"),
           top_k: tool.schema.number().optional().describe("Maximum number of results to return (alternative parameter)"),
-          scope: tool.schema.string().optional().describe('Search scope: "project" (this repo, default), "session" (this run only), or "global" (across ALL your projects). Only use "global" when the user explicitly asks to search across projects.'),
+          scope: tool.schema.string().optional().describe('Search scope: "project" (default), "session" (this run only), or "global" (drop user_id, server-wide). Only use "global" when the user explicitly asks.'),
         },
         async execute(args) {
           stats.searches++;
@@ -378,13 +367,12 @@ Identity context (resolved at plugin startup):
       get_memories: tool({
         description: "List or browse stored memories without a search query -- useful for auditing what is remembered or paging through everything in a scope. To find memories relevant to a question, use search_memories instead (it ranks by semantic relevance).",
         args: {
-          user_id: tool.schema.string().optional().describe("User ID"),
-          app_id: tool.schema.string().optional().describe("App/Project ID"),
+          user_id: tool.schema.string().optional().describe("User ID (defaults to plugin-resolved user_id)"),
           agent_id: tool.schema.string().optional().describe("Agent ID"),
-          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Metadata/identity filters"),
-          page: tool.schema.number().optional().describe("Page number"),
-          page_size: tool.schema.number().optional().describe("Page size"),
-          scope: tool.schema.string().optional().describe('Scope: "project" (default), "session", or "global" (across ALL your projects). Use "global" only when explicitly asked.'),
+          filters: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Extra metadata filters (informational; the server list endpoint honors identity + top_k only)"),
+          page: tool.schema.number().optional().describe("Page number (ignored — server has no pagination)"),
+          page_size: tool.schema.number().optional().describe("Page size, mapped to top_k"),
+          scope: tool.schema.string().optional().describe('Scope: "project" (default), "session", or "global" (drop user_id, server-wide). Use "global" only when explicitly asked.'),
         },
         async execute(args) {
           const scoped = readScopeFilters(args);
@@ -446,7 +434,7 @@ Identity context (resolved at plugin startup):
         },
         async execute(args) {
           if (dreamTriggered) dreamWriteSeen = true;
-          const sp = args.scope ? scopeWriteParams(asScope(args.scope), userId, appId, sessionId) : null;
+          const sp = args.scope ? scopeWriteParams(asScope(args.scope), userId, sessionId) : null;
           const res = await mem0.deleteAll({
             user_id: sp ? sp.user_id : (args.agent_id ? args.user_id : (args.user_id ?? userId)),
             run_id: sp?.run_id,
@@ -506,7 +494,7 @@ Identity context (resolved at plugin startup):
 
       const searchFilters: Record<string, unknown> = globalSearch
         ? {}
-        : {user_id: userId, app_id: appId};
+        : {user_id: userId};
 
       try {
         const all = await mem0.getAll(globalSearch ? {} : {user_id: userId});
@@ -522,11 +510,11 @@ Identity context (resolved at plugin startup):
 
         if (globalSearch) {
           systemContext.push(
-            `Global search is ON — searches return all memories across all users and projects. Writes still use user_id="${userId}", app_id="${appId}".`,
+            `Global search is ON — searches drop the user_id filter (server-wide). Writes still use user_id="${userId}".`,
           );
         } else {
           systemContext.push(
-            `Always include user_id="${userId}" and app_id="${appId}" in every search_memories filter and add_memory call.`,
+            `Always include user_id="${userId}" in every search_memories filter and add_memory call.`,
           );
         }
 
@@ -559,13 +547,13 @@ Identity context (resolved at plugin startup):
         }
 
         systemContext.push(
-          "Mem0 searches apply when user references past work, decision questions, errors, or non-trivial tasks. Queries use noun-phrases, 2-4 parallel calls with different metadata.type filters, and include user_id + app_id.",
+          "Mem0 searches apply when user references past work, decision questions, errors, or non-trivial tasks. Queries use noun-phrases, 2-4 parallel calls with different metadata.type filters, and include the current user_id.",
         );
         systemContext.push(SCOPE_GUIDANCE);
         const activeScope = loadDefaultScope();
         if (activeScope !== "project") {
           systemContext.push(
-            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${sessionId}"); "global" spans all your projects (app_id="*"). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
+            `Active default memory scope is "${activeScope}" (set via /mem0-scope). Memory tools use this when no explicit scope is given: "session" limits to this run (run_id="${sessionId}"); "global" drops user_id from the filter (server-wide). Pass an explicit scope to override per call. delete_all_memories still requires an explicit scope="global" to delete user-wide.`,
           );
         }
       } catch (err: any) {
@@ -616,7 +604,7 @@ Identity context (resolved at plugin startup):
       try {
         const resumeFilters: Record<string, unknown> = globalSearch
           ? {}
-          : {user_id: userId, app_id: appId};
+          : {user_id: userId};
         const [stateRes, decisionsRes] = await Promise.all([
           mem0.search({query: "session state current task", filters: resumeFilters, top_k: 3}),
           mem0.search({query: "recent decisions and learnings", filters: resumeFilters, top_k: 3}),
@@ -646,7 +634,7 @@ Identity context (resolved at plugin startup):
       try {
         const msgFilters: Record<string, unknown> = globalSearch
           ? {}
-          : {user_id: userId, app_id: appId};
+          : {user_id: userId};
         const res = await mem0.search({query: safeText, filters: msgFilters, top_k: 5});
         stats.searches++;
         const memories = extractMemories(res);
@@ -670,7 +658,6 @@ Identity context (resolved at plugin startup):
               confidence: 0.7,
               session_id: sessionId,
               branch,
-              app_id: appId,
             },
             infer: true,
           });
@@ -754,7 +741,7 @@ Identity context (resolved at plugin startup):
 
         const errorFilters: Record<string, unknown> = globalSearch
           ? {}
-          : {user_id: userId, app_id: appId};
+          : {user_id: userId};
         const res = await mem0.search({
           query: `error: ${errorQuery}`,
           filters: errorFilters,
@@ -782,7 +769,7 @@ Identity context (resolved at plugin startup):
   async function compactionHook(input: { sessionID?: string }, output: { context: string[]; prompt?: string }) {
     try {
       const compactSessionId = input?.sessionID ?? sessionId;
-      const summaryContent = `Session compacting. Project: ${appId}. Branch: ${branch}. Session: ${compactSessionId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
+      const summaryContent = `Session compacting. User: ${userId}. Branch: ${branch}. Session: ${compactSessionId}. Stats: ${stats.adds} memories stored, ${stats.searches} searches, ${stats.messages} messages.`;
       Promise.resolve().then(async () => {
         try {
           await mem0.add({
@@ -793,7 +780,6 @@ Identity context (resolved at plugin startup):
               source: "pre-compaction",
               session_id: compactSessionId,
               branch,
-              app_id: appId,
             },
             infer: true,
           });
@@ -803,7 +789,7 @@ Identity context (resolved at plugin startup):
 
       const compactFilters: Record<string, unknown> = globalSearch
         ? {}
-        : {user_id: userId, app_id: appId};
+        : {user_id: userId};
       const res = await mem0.search({
         query: "session state decisions learnings",
         filters: compactFilters,
