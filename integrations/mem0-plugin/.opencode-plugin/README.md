@@ -52,10 +52,11 @@ API-compatible with the cloud plugin:
 
 ## Identity & scope
 
-- `user_id` — **defaults to `<os_user>-<opencode_project_id>`** (the OpenCode
-  project id is exposed by the plugin runtime and is stable across branches,
-  worktrees, and vcs changes). This is how per-project isolation is achieved on
-  a server that has no `app_id` field.
+- `user_id` — **defaults to `<os_user>-<worktree_basename>-<project_id[:8]>`**
+  (the human-readable folder name plus the first 8 chars of the OpenCode
+  project id — the id suffix guarantees uniqueness when two projects share
+  a folder name, e.g. `/home/a/foo` vs `/tmp/foo`). This is how per-project
+  isolation is achieved on a server that has no `app_id` field.
 - Set `MEM0_USER_ID` to override — e.g. `MEM0_USER_ID=alice` to share memory
   across every repo you touch.
 - `run_id` — a fresh `ses_<epoch>_<hex>` per OpenCode session (for `session`

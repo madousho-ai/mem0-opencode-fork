@@ -15,7 +15,7 @@ import type {Plugin, PluginInput} from "@opencode-ai/plugin";
 import {tool} from "@opencode-ai/plugin";
 import {Mem0HttpClient} from "./client";
 import {userInfo} from "os";
-import {resolve, dirname} from "path";
+import {basename, resolve, dirname} from "path";
 import {existsSync, readFileSync, readdirSync} from "fs";
 import {homedir} from "os";
 import {join} from "path";
@@ -39,10 +39,26 @@ function getOsUser(): string {
   }
 }
 
+// OpenCode's Project has no explicit `name` field, so we derive a
+// human-readable identifier from the worktree path's last segment AND append
+// the first 8 chars of `project.id` so two projects with the same folder name
+// (`/home/a/foo` vs `/tmp/foo`) still get distinct user_ids. If only one of
+// worktree/id is available we degrade gracefully. Set MEM0_USER_ID explicitly
+// to override the whole scheme.
+const ID_SUFFIX_LEN = 8;
+
+function projectSlug(worktree?: string, id?: string): string | undefined {
+  const name = worktree ? basename(worktree.replace(/\/+$/, "")) : "";
+  const suffix = id ? id.slice(0, ID_SUFFIX_LEN) : "";
+  if (name && suffix) return `${name}-${suffix}`;
+  return name || suffix || undefined;
+}
+
 function projectUserId(project: PluginInput["project"] | undefined): string {
   if (process.env.MEM0_USER_ID) return process.env.MEM0_USER_ID;
   const osUser = getOsUser();
-  return project?.id ? `${osUser}-${project.id}` : osUser;
+  const slug = projectSlug(project?.worktree, project?.id);
+  return slug ? `${osUser}-${slug}` : osUser;
 }
 
 async function getBranch($: any): Promise<string> {
@@ -186,8 +202,10 @@ const Mem0Plugin: Plugin = async (ctx) => {
     try {
       const res: any = await client.session.get({path: {id: sessionID}});
       const info: any = res?.data ?? res;
+      const directory: string | undefined = info?.directory;
       const projectID: string | undefined = info?.projectID;
-      if (projectID) return `${getOsUser()}-${projectID}`;
+      const slug = projectSlug(directory, projectID);
+      if (slug) return `${getOsUser()}-${slug}`;
     } catch {
     }
     return projectUserId(project);

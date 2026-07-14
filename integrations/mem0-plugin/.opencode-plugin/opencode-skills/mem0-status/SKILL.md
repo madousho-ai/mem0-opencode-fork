@@ -40,7 +40,7 @@ _SCOPE="$(grep -o '"default_scope"[[:space:]]*:[[:space:]]*"[a-z]*"' "$_S" 2>/de
 echo "default_scope=${_SCOPE:-project}"
 ```
 
-- `user_id`: from `MEM0_USER_ID` (the plugin encodes the OpenCode project id into this — e.g. `alice-a1b2c3d4`). If MEM0_USER_ID is set as an env override, that wins.
+- `user_id`: from `MEM0_USER_ID` (the plugin encodes the OpenCode project's worktree basename + short id into this — e.g. `alice-mem0-opencode-fork-a1b2c3d4`). If MEM0_USER_ID is set as an env override, that wins.
 - `session_id`: from `MEM0_SESSION_ID` (this session's OpenCode session id; also used as `run_id` for `scope="session"`).
 - `branch`: from `MEM0_BRANCH` (git-detected at plugin startup; falls back to `main` outside a git repo).
 - `default_scope`: from `~/.mem0/settings.json` (`default_scope`), falling back to `project`. Change with `/mem0-scope`.
@@ -121,11 +121,11 @@ Report:
 ## mem0 status
 
 PASS  Server          http://localhost:8888 (m0sk_...)
-PASS  Identity        user_id=alice-a1b2c3d4, branch=main
+PASS  Identity        user_id=alice-mem0-opencode-fork-a1b2c3d4, branch=main
 PASS  Default scope   project
 PASS  Memory Tools    142ms
 PASS  Write/Read      write + delete OK
-PASS  Session         session_id=abc123, user_id=alice-a1b2c3d4, branch=main
+PASS  Session         session_id=abc123, user_id=alice-mem0-opencode-fork-a1b2c3d4, branch=main
 WARN  Auto-dream      waiting — sessions 2/5, memories 3/20 (/mem0-dream to run now)
 
 All checks passed.
