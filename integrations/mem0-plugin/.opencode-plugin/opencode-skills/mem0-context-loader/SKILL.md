@@ -18,14 +18,15 @@ Pre-fetches relevant memories to prime context before working on a task.
 
 1. **Extract topics** from current message/task. Identify: file paths, module names, feature areas, error patterns.
 
-2. **Run 2-4 parallel `search_memories` calls** with different angles:
+2. **Run 2-4 parallel `search_memories` calls** with different angles. Filters
+   are flat dicts — the self-hosted server does NOT understand AND/OR trees:
 
    | Query angle | Filter | Purpose |
    |---|---|---|
-   | Feature/module name | `{"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}, {"metadata": {"type": "decision"}}]}` | Architecture decisions |
-   | File paths mentioned | `{"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}, {"metadata": {"type": "convention"}}]}` | Coding patterns |
-   | Error keywords (if any) | `{"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}, {"metadata": {"type": "anti_pattern"}}]}` | Known pitfalls |
-   | Broad project context | `{"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}` | Catch-all |
+   | Feature/module name | `{"user_id": "<id>", "type": "decision"}` | Architecture decisions |
+   | File paths mentioned | `{"user_id": "<id>", "type": "convention"}` | Coding patterns |
+   | Error keywords (if any) | `{"user_id": "<id>", "type": "anti_pattern"}` | Known pitfalls |
+   | Broad project context | `{"user_id": "<id>"}` | Catch-all |
 
 3. **Deduplicate** results by memory ID across all search responses.
 

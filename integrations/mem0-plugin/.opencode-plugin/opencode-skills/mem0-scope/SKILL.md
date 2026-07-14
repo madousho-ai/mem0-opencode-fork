@@ -1,6 +1,6 @@
 ---
 name: mem0-scope
-description: Views or changes the default memory scope (project, session, or global) used when saving and searching memories. Use when the user wants to control whether memories are scoped to this repo, this run, or shared across all their projects.
+description: Views or changes the default memory scope (project, session, or global) used when saving and searching memories. Use when the user wants to control whether memories are scoped to this user_id, this run, or every memory the server holds.
 ---
 
 # Mem0 Scope
@@ -10,13 +10,14 @@ no explicit `scope` is given. The setting persists in `~/.mem0/settings.json`
 (`default_scope`) and the plugin reads it fresh on each memory operation, so a
 change takes effect immediately in the current session.
 
-The three scopes:
+The three scopes (self-hosted server: identity is just `user_id` + optional
+`run_id`; the project name is folded into `user_id` at plugin startup):
 
-- `project` (default) — this repo only. Filters by `user_id` + `app_id`.
-- `session` — this run only. Adds `run_id` (the current session) so memories are
-  isolated to this conversation.
-- `global` — across ALL your projects. Reads use `app_id="*"`; writes drop
-  `app_id` so the memory is user-wide.
+- `project` (default) — this repo only. Filters by the current `user_id`.
+- `session` — this run only. Adds `run_id` (the current session) so memories
+  are isolated to this conversation.
+- `global` — server-wide. Drops `user_id` from filters so reads and writes
+  span every memory this server holds.
 
 ## Execution
 
@@ -50,12 +51,11 @@ Look at the user's message for a target scope word: `project`, `session`, or
 
    Current default scope: <current>
 
-     project  - this repo only (user + app_id)        <marker if active>
-     session  - this run only (adds run_id)           <marker if active>
-     global   - all your projects (app_id = *)         <marker if active>
+     project  - this user_id only                         <marker if active>
+     session  - this run only (adds run_id)               <marker if active>
+     global   - server-wide (drops user_id from filters)  <marker if active>
 
    User:    ${MEM0_USER_ID}
-   Project: ${MEM0_APP_ID}
    Session: ${MEM0_SESSION_ID}
 
    To change: /mem0-scope session    (or project / global)
@@ -100,19 +100,21 @@ Look at the user's message for a target scope word: `project`, `session`, or
    ```
 
    Effect lines:
-   - project → "New memories and searches are limited to this repo."
+   - project → "New memories and searches are limited to the current user_id (this repo)."
    - session → "New memories and searches are limited to this run (this conversation)."
-   - global  → "New memories and searches span all your projects. delete_all_memories still needs an explicit scope=global to delete user-wide."
+   - global  → "New memories and searches drop user_id — they span every memory on this self-hosted server. delete_all_memories still needs an explicit scope=global to delete server-wide."
 
 ### Notes
 
 - This only changes the **default**. Any memory tool call can still pass an
   explicit `scope` to override it for that one call.
 - `delete_all_memories` deliberately ignores the default scope: deleting
-  user-wide always requires an explicit `scope="global"`, so changing the
-  default can never turn a routine cleanup into a cross-project wipe.
-- `global` scope (this user, all their projects) is distinct from the separate
-  `global_search` setting (all users). Leave `global_search` untouched here.
+  server-wide always requires an explicit `scope="global"`, so changing the
+  default can never turn a routine cleanup into a cross-user wipe. The
+  self-hosted server also requires an admin API key for that call.
+- `global` scope (drop user_id) is distinct from the separate `global_search`
+  setting (drop user_id at session-start context loading). Leave
+  `global_search` untouched here.
 
 ## Output formatting
 

@@ -1,6 +1,6 @@
 ---
 name: mem0-status
-description: Diagnoses mem0 connectivity, API key validity, and memory read/write functionality. Use when memory operations fail, searches return empty, add_memory errors occur, or to verify the plugin is working correctly.
+description: Diagnoses mem0 connectivity, API base URL, and memory read/write functionality against the self-hosted server. Use when memory operations fail, searches return empty, add_memory errors occur, or to verify the plugin is working correctly.
 ---
 
 # Mem0 Status
@@ -11,15 +11,17 @@ Run a diagnostic check on the mem0 plugin. Useful for troubleshooting.
 
 Run ALL checks, then display a single summary. Do not stop on the first failure.
 
-### Check 1: API key
+### Check 1: Server endpoint
 
 ```bash
+_URL="${MEM0_API_BASE_URL:-}"
 _KEY="${MEM0_API_KEY:-}"
-[ -n "$_KEY" ] && echo "${_KEY:0:6}..." || echo "NOT_SET"
+[ -n "$_URL" ] && echo "base_url=$_URL" || echo "base_url=NOT_SET"
+[ -n "$_KEY" ] && echo "api_key=${_KEY:0:6}..." || echo "api_key=UNSET (server may have AUTH_DISABLED=true)"
 ```
 
-- If `NOT_SET`: FAIL — "No API key configured"
-- If set: PASS — the command already prints only the first 6 chars
+- If `MEM0_API_BASE_URL` is `NOT_SET`: FAIL — "Point MEM0_API_BASE_URL at your self-hosted server (e.g. http://localhost:8888)."
+- If `MEM0_API_KEY` is unset: WARN unless the server was started with `AUTH_DISABLED=true`.
 
 ### Check 2: Identity resolution
 
@@ -27,25 +29,23 @@ Resolve identity from the `MEM0_*` environment variables set by the plugin's `sh
 
 ```bash
 echo "user_id=${MEM0_USER_ID:-${USER:-default}}"
-echo "project_id=${MEM0_APP_ID:-}"
 echo "branch=${MEM0_BRANCH:-main}"
 _S="$HOME/.mem0/settings.json"
 _SCOPE="$(grep -o '"default_scope"[[:space:]]*:[[:space:]]*"[a-z]*"' "$_S" 2>/dev/null | grep -o '[a-z]*"$' | tr -d '"')"
 echo "default_scope=${_SCOPE:-project}"
 ```
 
-- `user_id`: from `MEM0_USER_ID`, falling back to `$USER`
-- `project_id`: from `MEM0_APP_ID`
+- `user_id`: from `MEM0_USER_ID` (the plugin encodes the repo name into this by default — e.g. `alice-owner-repo`)
 - `branch`: from `MEM0_BRANCH` (the plugin's resolved value; falls back to `main` outside a git repo)
 - `default_scope`: from `~/.mem0/settings.json` (`default_scope`), falling back to `project`. This is the scope memory tools use when none is given; change it with `/mem0-scope`.
 
-PASS if `user_id` and `project_id` are non-empty. WARN if `project_id` is empty — the `shell.env` hook may not have fired (restart OpenCode). Report the branch verbatim from `MEM0_BRANCH`; never invent a string like `(not a git repo)`.
+PASS if `user_id` is non-empty. Report the branch verbatim from `MEM0_BRANCH`; never invent a string like `(not a git repo)`.
 
 ### Check 3: Memory tool connectivity
 
 Call `search_memories` with:
 - `query="health check"`
-- `filters={"AND": [{"user_id": "<active_user_id>"}, {"app_id": "<active_project_id>"}]}`
+- `filters={"user_id": "<active_user_id>"}` (flat dict — self-hosted server does NOT understand AND/OR trees)
 - `top_k=1`
 
 - If returns successfully (even empty): PASS
@@ -56,14 +56,14 @@ Call `search_memories` with:
 Call `add_memory` with:
 - `text="Health check probe — safe to delete."`
 - `user_id=<active_user_id>`
-- `app_id=<active_project_id>`
 - `metadata={"type": "health_check", "probe": true}`
 - `infer=False`
 
-The response returns `event_id` (v3 writes are async). Call `get_event_status(event_id=<event_id>)` to check processing.
+The self-hosted server responds synchronously — the response body contains the
+created memory (`results[0].id`). There is no event queue. Extract the ID and
+call `delete_memory` to clean up.
 
-- If status is `SUCCEEDED`: PASS — extract the memory ID from the event result, then call `delete_memory` with that ID to clean up.
-- If status is `PENDING` after 5 seconds: PASS (write accepted, processing delayed)
+- If write + delete succeed: PASS
 - If errors: FAIL — show the error.
 
 ### Check 5: Session context
@@ -72,7 +72,7 @@ Check that the plugin's `shell.env` hook has injected session context into the e
 
 ```bash
 echo "session_id=${MEM0_SESSION_ID:-}"
-echo "app_id=${MEM0_APP_ID:-}"
+echo "user_id=${MEM0_USER_ID:-}"
 echo "branch=${MEM0_BRANCH:-}"
 ```
 
@@ -97,7 +97,7 @@ echo "now_s=$(date +%s)"
 echo "dream_env=${MEM0_DREAM:-unset}"
 ```
 
-For the memory count, reuse the project memory count from Check 3/4 (or call `get_memories` with the project filter, `page_size=1`, and read `count`).
+For the memory count, reuse the project memory count from Check 3/4 (or call `get_memories` with `scope="project"`, `page_size=1`).
 
 Compute each gate:
 - **time**: `hours_since = (now_s - last_consolidated_ms/1000) / 3600`. Passes when `≥ min_hours`. If `last_consolidated_ms` is 0 it has never run → time gate passes.
@@ -114,12 +114,12 @@ Report:
 ```
 ## mem0 status
 
-PASS  API Key         m0-dVe...
-PASS  Identity        user=kartik, project=mem0, branch=main
+PASS  Server          http://localhost:8888 (m0sk_...)
+PASS  Identity        user_id=alice-owner-repo, branch=main
 PASS  Default scope   project
 PASS  Memory Tools    142ms
 PASS  Write/Read      write + delete OK
-PASS  Session         session_id=abc123, app_id=mem0, branch=main
+PASS  Session         session_id=abc123, user_id=alice-owner-repo, branch=main
 WARN  Auto-dream      waiting — sessions 2/5, memories 3/20 (/mem0-dream to run now)
 
 All checks passed.
@@ -135,7 +135,7 @@ When invoked with `--deep` (e.g., `/mem0-status --deep`), run the standard 6 che
 
 ### Quality Check 1: Duplicates
 
-Call `get_memories` with `filters={"AND": [{"user_id": "<active_user_id>"}, {"app_id": "<active_project_id>"}]}`, `page_size=200`. Compare all pairs within the same `metadata.type` group for high textual overlap (shared nouns/keywords > 60%). Report:
+Call `get_memories` with `filters={"user_id": "<active_user_id>"}`, `page_size=200`. Compare all pairs within the same `metadata.type` group for high textual overlap (shared nouns/keywords > 60%). Report:
 
 ```
 Potential duplicates: <N> pairs
@@ -173,7 +173,7 @@ Possible contradictions: <N>
 
 ### Quality Check 4: Orphan memories
 
-Memories with no `metadata.type` set, or with `metadata.type` not in the 17 known coding categories. These were likely written without proper tagging.
+Memories with no `metadata.type` set. Client-side classification is on you — the self-hosted server does not auto-tag categories.
 
 ```
 Untagged/orphan memories: <N>

@@ -34,7 +34,6 @@ Based on the content, pick the best `metadata.type`:
 Call `add_memory` with:
 - `text="<the user's text>"`
 - `user_id=<active_user_id>`
-- `app_id=<active_project_id>`
 - `metadata={"type": "<classified_type>", "branch": "<active_branch>", "confidence": 1.0, "source": "remember_command"}`
 - `infer=False`
 
@@ -43,15 +42,13 @@ Call `add_memory` with:
 
 ### Step 4: Confirm
 
-The `add_memory` response returns `event_id` (not `memory_id`) because writes are async.
-Call `get_event_status(event_id=<event_id>)` once.
-
-- If status is `SUCCEEDED`: print the memory ID from the result.
-- If status is `PENDING` or `processing`: print with the event ID as fallback.
+The self-hosted server responds synchronously — the `add_memory` result
+contains the created memory (`results[0].id`) directly. There is no event
+queue and no `get_event_status` tool.
 
 ```
 Remembered as <type>: "<content, first 80 chars>"
-Memory ID: <id from event status>
+Memory ID: <id from response>
 ```
 
 Append `...` only if content was truncated (longer than 80 chars).

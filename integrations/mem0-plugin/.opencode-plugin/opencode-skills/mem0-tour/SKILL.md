@@ -7,38 +7,46 @@ description: Browses all stored memories grouped by category with full content d
 
 Show the user what mem0 has stored for the current project.
 
+The self-hosted server has NO `app_id` field — the plugin folds the repo name
+into `user_id`, so "the current project" = "the current user_id". Cross-project
+means "override MEM0_USER_ID with the bare identifier the user chose for
+sharing across projects".
+
 ## Cross-project mode
 
 When invoked with `--all-projects` (e.g., `/mem0-tour --all-projects` or
-`/mem0-tour --all-projects auth middleware`), search across ALL projects:
+`/mem0-tour --all-projects auth middleware`), search across every user_id
+on the server. This requires admin permissions on the server:
 
-1. Call `get_memories` with `filters={"AND": [{"user_id": "<active_user_id>"}]}`, `page_size=200` — **no `app_id` filter**.
-2. If a search query was also provided, run `search_memories` with `query=<query>`,
-   `filters={"AND": [{"user_id": "<active_user_id>"}]}`, `top_k=20` — again no `app_id`.
-3. Group results by `app_id` first, then by category within each project.
+1. Call `get_memories` with `scope="global"` (drops user_id from the filter),
+   `page_size=200`.
+2. If a search query was also provided, run `search_memories` with
+   `query=<query>`, `scope="global"`, `top_k=20`.
+3. Group results by `user_id` first, then by category within each user_id.
 4. Display:
    ```
-   ## <app_id_1> (<N> memories) ← current
-   **Architecture Decisions** — <memory content>
+   ## <user_id_1> (<N> memories) ← current
+   Architecture Decisions - <memory content>
    ...
 
-   ## <app_id_2> (<N> memories)
+   ## <user_id_2> (<N> memories)
    ...
 
-   <N> memories across <M> projects
+   <N> memories across <M> user_ids
    ```
-5. Mark the current project with `← (current)` in the heading.
+5. Mark the current user_id with `← (current)` in the heading.
 
-If `--all-projects` is NOT present, use the standard single-project flow below.
+If `--all-projects` is NOT present, use the standard single-user_id flow below.
 
 ## Peek mode (compact search)
 
 When `/mem0-tour` receives a search query argument (e.g., `/mem0-tour auth middleware`)
-WITHOUT `--all-projects`, run in **peek mode** — compact one-liner results:
+WITHOUT `--all-projects`, run in **peek mode** — compact one-liner results.
+Filters are flat dicts; the self-hosted server does NOT understand AND/OR trees:
 
 1. Run 2 parallel `search_memories` calls:
-   - Broad: `query=<query>`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=10`, `rerank=true`
-   - Targeted: `query=<query>`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}, {"metadata": {"type": "decision"}}]}`, `top_k=5`, `rerank=true`
+   - Broad: `query=<query>`, `filters={"user_id": "<id>"}`, `top_k=10`
+   - Targeted: `query=<query>`, `filters={"user_id": "<id>", "type": "decision"}`, `top_k=5`
 2. Deduplicate by ID, display compact results:
    ```
    ## mem0 search: "<query>" (<N> results)
@@ -48,48 +56,50 @@ WITHOUT `--all-projects`, run in **peek mode** — compact one-liner results:
    3. [convention] All middleware in src/middleware/ (2025-05-08) [mem0:c4d5e6f7]
    ```
    Format: `<number>. [<type>] <content, 80 chars> (<date>) [mem0:<short_id>]`
-3. If no results: `No memories matching "<query>" for project <project_id>.`
+3. If no results: `No memories matching "<query>" for user_id <active_user_id>.`
 
 If no query argument and no `--all-projects` flag, use the full tour flow below.
 
 ## Execution
 
-### Step 1: Fetch ALL memories for this project
+### Step 1: Fetch ALL memories for this user_id
 
-Call `get_memories` to fetch all memories for this project:
+Call `get_memories` to fetch memories for the current user_id:
 
-`filters={"AND": [{"user_id": "<active_user_id>"}, {"app_id": "<active_project_id>"}]}`, `page_size=100`
+`filters={"user_id": "<active_user_id>"}`, `page_size=100`
+
+(Note: the self-hosted GET /memories endpoint honors identity + `top_k` only —
+extra metadata filters go into the response but not the query.)
 
 ### Step 2: Run supplementary semantic searches
 
 In parallel, run these `search_memories` calls to get relevance-ranked results for key topics:
 
-- `query="architecture decisions design choices"`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=10`, `rerank=true`
-- `query="bugs errors failures anti-patterns"`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=10`, `rerank=true`
-- `query="project setup tooling conventions preferences"`, `filters={"AND": [{"user_id": "<id>"}, {"app_id": "<pid>"}]}`, `top_k=10`, `rerank=true`
+- `query="architecture decisions design choices"`, `filters={"user_id": "<id>"}`, `top_k=10`
+- `query="bugs errors failures anti-patterns"`, `filters={"user_id": "<id>"}`, `top_k=10`
+- `query="project setup tooling conventions preferences"`, `filters={"user_id": "<id>"}`, `top_k=10`
 
-**Do NOT filter by `metadata.type` in these calls.** The platform auto-assigns `categories` — filtering on `metadata.type` misses memories that were auto-categorized but don't have an explicit `metadata.type`.
+Do NOT filter by `metadata.type` in these calls — filtering there misses
+memories tagged only by the writer's ad-hoc convention.
 
 ### Step 3: Merge and group
 
-Merge all results by memory ID (deduplicate). For each memory, determine its group using this priority:
+Merge all results by memory ID (deduplicate). For each memory, determine its
+group from `metadata.type` (the self-hosted server has no server-side
+`categories` field — grouping relies on the type you set at write time). Fall
+back to "other" when `metadata.type` is missing.
 
-1. **Platform `categories` field** (array on each memory, auto-assigned by Mem0). Use the first category value.
-2. **`metadata.type` field** (if present, set explicitly by hooks/agent). Use as fallback if no `categories`.
-3. **"other"** bucket for memories with neither.
+Map `metadata.type` to display names:
 
-Map category names to display names:
-
-| Platform category / metadata.type | Display name |
+| metadata.type | Display name |
 |---|---|
-| `architecture decisions`, `architecture_decisions`, `decision` | Architecture Decisions |
-| `anti patterns`, `anti_patterns`, `anti_pattern` | Anti-Patterns |
-| `task learnings`, `task_learnings`, `task_learning` | Task Learnings |
-| `coding conventions`, `coding_conventions`, `convention` | Coding Conventions |
-| `user preferences`, `user_preferences`, `user_preference` | User Preferences |
-| `project profile`, `project_profile` | Project Profile |
-| `tooling setup`, `tooling_setup`, `environmental` | Tooling & Setup |
-| `technology`, `professional_details` | Tooling & Setup |
+| `architecture_decisions`, `decision` | Architecture Decisions |
+| `anti_patterns`, `anti_pattern` | Anti-Patterns |
+| `task_learnings`, `task_learning` | Task Learnings |
+| `coding_conventions`, `convention` | Coding Conventions |
+| `user_preferences`, `user_preference` | User Preferences |
+| `project_profile` | Project Profile |
+| `tooling_setup`, `environmental` | Tooling & Setup |
 | `session_state` | Session State |
 | `compact_summary` | Compact Summaries |
 | anything else | Other |
@@ -104,7 +114,7 @@ First show the category summary table:
 mem0 tour
 
 Session (ses_abc123)  branch: main
-Project: my-project  -  349 memories
+User: alice-owner-repo  -  349 memories
 
 Category                   Count
 -----------------------------------------
@@ -119,7 +129,7 @@ Then for each category (sorted by count descending), show memories as numbered o
 
 ```
 tooling_setup (119)
-  1. User requires that no git commit or push be performed without explicit permission... 
+  1. User requires that no git commit or push be performed without explicit permission...
   2. OpenCode plugins are loaded from ~/.config/opencode/plugins/ for global installation...
   3. Assistant determined that the symlink method for loading the Mem0 plugin was failing...
   ... and 116 more
@@ -138,16 +148,16 @@ Skip empty groups entirely.
 
 ```
 <N> memories across <M> categories
-project: <project_id>  branch: <active_branch>
+user_id: <active_user_id>  branch: <active_branch>
 
-Identity - user: <user_id>  project: <project_id>  branch: <branch>
+Identity - user_id: <user_id>  branch: <branch>
 ```
 
 ### Step 6: Empty state
 
-If zero memories found for this project, print:
+If zero memories found for this user_id, print:
 ```
-No memories stored yet for project <project_id>.
+No memories stored yet for user_id <active_user_id>.
 Start working - mem0 captures learnings automatically, or use /mem0-remember to save something now.
 ```
 
