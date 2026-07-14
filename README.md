@@ -1,27 +1,38 @@
 # Mem0 OpenCode Plugin (Self-Hosted)
 
-A fork of the Mem0 OpenCode plugin that adds support for self-hosted Mem0 instances.
+A fork of the Mem0 OpenCode plugin that swaps the hosted mem0.ai cloud API for
+a **self-hosted mem0 FastAPI server** (this repo's `server/`).
 
 ## Features
 
-* Connect to self-hosted Mem0 servers
-* Compatible with OpenCode
-* Based on the official Mem0 OpenCode plugin
+- Plugin targets any HTTP endpoint via `MEM0_API_BASE_URL`
+- Bundles its own thin REST client — no `mem0ai` npm SDK dependency
+- Works against `server/` on `docker-compose up` (localhost:8888)
+- Optional auth: works with `AUTH_DISABLED=true` in dev, or `X-API-Key` in prod
 
 ## Why
 
-The official plugin is primarily designed for the hosted Mem0 service. This fork adds support for connecting to self-hosted Mem0 deployments.
+The upstream plugin is hard-wired to `api.mem0.ai/v1/*`. This fork rewires
+every memory operation to the self-hosted OSS server, drops the cloud-only
+features that the server never had (`app_id`, custom categories, async event
+queue, `AND/OR` filters), and folds project isolation into `user_id` so the
+server's flat identity model is enough. See
+[integrations/mem0-plugin/.opencode-plugin/README.md](integrations/mem0-plugin/.opencode-plugin/README.md)
+for the plugin-side setup guide.
 
-## Installation
+## Quick start
 
-Follow the same installation process as the official Mem0 OpenCode plugin, then configure the plugin to use your self-hosted Mem0 server.
+```bash
+# 1. Run the self-hosted mem0 server
+cd server && docker-compose up
+
+# 2. Point the plugin at it (in the shell where you launch OpenCode)
+export MEM0_API_BASE_URL="http://localhost:8888"
+
+# 3. Install the plugin
+opencode plugin @mem0/opencode-plugin
+```
 
 ## License
 
-This project is a fork of the official Mem0 project and is licensed under the Apache License 2.0. See the `LICENSE` file for details.
-
-## Acknowledgements
-
-This project is based on the excellent work from the Mem0 team.
-
-Original project: https://github.com/mem0ai/mem0
+Apache-2.0. Original project: https://github.com/mem0ai/mem0
